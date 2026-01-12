@@ -1,0 +1,1119 @@
+#!/usr/bin/env bash
+#
+# apr - Automated Plan Reviser Pro (v1.0.0)
+# Iterative specification refinement with GPT Pro Extended Reasoning via Oracle
+#
+# FEATURES:
+#   - Beautiful gum-based terminal UI with graceful ANSI fallback
+#   - Interactive workflow setup wizard
+#   - Multi-round revision tracking with git integration
+#   - GPT Pro 5.2 Extended Reasoning via Oracle browser automation
+#   - Session monitoring and reattachment
+#   - Configurable document bundles (README, spec, implementation)
+#   - Automatic template generation and round management
+#
+# Usage:
+#   apr [command] [options]
+#
+# Commands:
+#   run <round>        Run a revision round (default command)
+#   setup              Interactive workflow setup wizard
+#   status             Check Oracle session status
+#   attach <session>   Attach to a running/completed session
+#   list               List all configured workflows
+#   history            Show revision history for current workflow
+#   help               Show help message
+#
+# Options:
+#   -w, --workflow     Workflow name (default: from .apr/config.yaml or 'default')
+#   -i, --include-impl Include implementation document
+#   -d, --dry-run      Preview without sending to GPT Pro
+#   -r, --render       Render bundle for manual paste
+#   -c, --copy         Copy rendered bundle to clipboard
+#   --wait             Wait for completion (blocking)
+#   --login            Manual login mode (first-time setup)
+#   --keep-browser     Keep browser open after completion
+#   -v, --verbose      Verbose output
+#   --version          Show version
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# -----------------------------------------------------------------------------
+# Exit Codes
+# -----------------------------------------------------------------------------
+readonly EXIT_SUCCESS=0
+readonly EXIT_GENERAL_ERROR=1
+readonly EXIT_USAGE_ERROR=2
+readonly EXIT_DEPENDENCY_ERROR=3
+readonly EXIT_CONFIG_ERROR=4
+readonly EXIT_NETWORK_ERROR=10
+readonly EXIT_AUTH_REQUIRED=11
+readonly EXIT_ORACLE_ERROR=12
+readonly EXIT_INTERNAL_ERROR=20
+
+# -----------------------------------------------------------------------------
+# Colors (fallback when gum not available)
+# -----------------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+ITALIC='\033[3m'
+NC='\033[0m'
+
+# Gum availability flag
+GUM_AVAILABLE=false
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APR_HOME="${APR_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/apr}"
+APR_CACHE="${APR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/apr}"
+CONFIG_DIR=".apr"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+
+# Oracle command (determined at runtime)
+ORACLE_CMD=""
+
+# -----------------------------------------------------------------------------
+# Gum Installation & Detection
+# -----------------------------------------------------------------------------
+
+try_install_gum() {
+    local os="unknown"
+    case "$(uname -s)" in
+        Darwin*) os="macos" ;;
+        Linux*)  os="linux" ;;
+    esac
+
+    case "$os" in
+        macos)
+            if command -v brew &> /dev/null; then
+                brew install gum &>/dev/null && return 0
+            fi
+            ;;
+        linux)
+            if command -v apt-get &> /dev/null; then
+                (
+                    sudo mkdir -p /etc/apt/keyrings 2>/dev/null
+                    curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null
+                    echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list >/dev/null
+                    sudo apt-get update -qq && sudo apt-get install -y -qq gum
+                ) &>/dev/null && return 0
+            elif command -v dnf &> /dev/null; then
+                (
+                    echo '[charm]
+name=Charm
+baseurl=https://repo.charm.sh/yum/
+enabled=1
+gpgcheck=1
+gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo >/dev/null
+                    sudo dnf install -y gum
+                ) &>/dev/null && return 0
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -S --noconfirm gum &>/dev/null && return 0
+            fi
+
+            # Fallback: GitHub releases
+            local arch
+            arch=$(uname -m)
+            case "$arch" in
+                x86_64) arch="amd64" ;;
+                aarch64|arm64) arch="arm64" ;;
+                *) return 1 ;;
+            esac
+
+            local tmp_dir gum_version="0.14.5"
+            tmp_dir=$(mktemp -d)
+            local gum_url="https://github.com/charmbracelet/gum/releases/download/v${gum_version}/gum_${gum_version}_Linux_${arch}.tar.gz"
+
+            (
+                cd "$tmp_dir"
+                curl -fsSL "$gum_url" -o gum.tar.gz
+                tar -xzf gum.tar.gz
+                sudo mv gum /usr/local/bin/gum 2>/dev/null || {
+                    mkdir -p ~/.local/bin
+                    mv gum ~/.local/bin/gum
+                }
+            ) &>/dev/null && rm -rf "$tmp_dir" && return 0
+
+            rm -rf "$tmp_dir"
+            ;;
+    esac
+
+    return 1
+}
+
+check_gum() {
+    if command -v gum &> /dev/null; then
+        GUM_AVAILABLE=true
+        return 0
+    fi
+
+    if [[ -t 1 && -z "${CI:-}" && -z "${APR_NO_GUM:-}" ]]; then
+        if try_install_gum; then
+            if [[ -x "${HOME}/.local/bin/gum" && ":$PATH:" != *":${HOME}/.local/bin:"* ]]; then
+                export PATH="${HOME}/.local/bin:${PATH}"
+            fi
+            if command -v gum &> /dev/null; then
+                GUM_AVAILABLE=true
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+# Oracle Detection
+# -----------------------------------------------------------------------------
+
+check_oracle() {
+    if command -v oracle &> /dev/null; then
+        ORACLE_CMD="oracle"
+        return 0
+    elif command -v npx &> /dev/null; then
+        ORACLE_CMD="npx -y @steipete/oracle"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Styled Output Functions
+# -----------------------------------------------------------------------------
+
+print_banner() {
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border double \
+            --border-foreground 212 \
+            --padding "0 2" \
+            --margin "1 0" \
+            --bold \
+            --foreground 212 \
+            "  Automated Plan Reviser Pro v${VERSION}" \
+            "  Iterative AI-Powered Spec Refinement" >&2
+    else
+        echo "" >&2
+        echo -e "${BOLD}${MAGENTA}╔════════════════════════════════════════════════════════════╗${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}║${NC}  ${BOLD}${WHITE}  Automated Plan Reviser Pro${NC} ${DIM}v${VERSION}${NC}               ${BOLD}${MAGENTA}║${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}║${NC}  ${DIM}Iterative AI-Powered Spec Refinement${NC}                     ${BOLD}${MAGENTA}║${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}╚════════════════════════════════════════════════════════════╝${NC}" >&2
+        echo "" >&2
+    fi
+}
+
+print_header() {
+    local text="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 214 --bold "$text" >&2
+    else
+        echo -e "${BOLD}${YELLOW}$text${NC}" >&2
+    fi
+}
+
+print_success() {
+    local text="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 82 "✓ $text" >&2
+    else
+        echo -e "${GREEN}✓${NC} $text" >&2
+    fi
+}
+
+print_error() {
+    local text="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 196 "✗ $text" >&2
+    else
+        echo -e "${RED}✗${NC} $text" >&2
+    fi
+}
+
+print_warning() {
+    local text="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 214 "⚠ $text" >&2
+    else
+        echo -e "${YELLOW}⚠${NC} $text" >&2
+    fi
+}
+
+print_info() {
+    local text="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 39 "ℹ $text" >&2
+    else
+        echo -e "${CYAN}ℹ${NC} $text" >&2
+    fi
+}
+
+print_dim() {
+    local text="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --faint "$text" >&2
+    else
+        echo -e "${DIM}$text${NC}" >&2
+    fi
+}
+
+print_step() {
+    local step="$1"
+    local total="$2"
+    local text="$3"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 212 --bold "[$step/$total]" --faint " $text" >&2
+    else
+        echo -e "${BOLD}${MAGENTA}[$step/$total]${NC} ${DIM}$text${NC}" >&2
+    fi
+}
+
+spin() {
+    local text="$1"
+    shift
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum spin --spinner dot --title "$text" -- "$@"
+    else
+        echo -e "${CYAN}◐${NC} $text" >&2
+        "$@"
+    fi
+}
+
+confirm() {
+    local prompt="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum confirm "$prompt"
+    else
+        read -rp "$prompt [y/N] " response
+        [[ "$response" =~ ^[Yy]$ ]]
+    fi
+}
+
+choose() {
+    local prompt="$1"
+    shift
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum choose --header "$prompt" "$@"
+    else
+        echo "$prompt" >&2
+        local i=1
+        for opt in "$@"; do
+            echo "  $i) $opt" >&2
+            ((i++))
+        done
+        read -rp "Enter number: " choice
+        local idx=1
+        for opt in "$@"; do
+            if [[ "$idx" == "$choice" ]]; then
+                echo "$opt"
+                return 0
+            fi
+            ((idx++))
+        done
+        echo "$1"  # default to first
+    fi
+}
+
+input() {
+    local prompt="$1"
+    local default="${2:-}"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        if [[ -n "$default" ]]; then
+            gum input --placeholder "$default" --prompt "$prompt: " --value "$default"
+        else
+            gum input --prompt "$prompt: "
+        fi
+    else
+        if [[ -n "$default" ]]; then
+            read -rp "$prompt [$default]: " value
+            echo "${value:-$default}"
+        else
+            read -rp "$prompt: " value
+            echo "$value"
+        fi
+    fi
+}
+
+file_picker() {
+    local prompt="$1"
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum file --all --file --header "$prompt"
+    else
+        read -rp "$prompt (enter path): " path
+        echo "$path"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Configuration Management
+# -----------------------------------------------------------------------------
+
+ensure_config_dir() {
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        mkdir -p "$CONFIG_DIR/rounds"
+        mkdir -p "$CONFIG_DIR/templates"
+    fi
+}
+
+load_config() {
+    local workflow="${1:-default}"
+    local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
+
+    if [[ ! -f "$config_path" ]]; then
+        config_path="$CONFIG_DIR/config.yaml"
+    fi
+
+    if [[ ! -f "$config_path" ]]; then
+        return 1
+    fi
+
+    # Source the config (simple key=value format for now)
+    # In a real implementation, we'd use yq or similar
+    echo "$config_path"
+}
+
+get_config_value() {
+    local key="$1"
+    local config_file="$2"
+    grep "^${key}:" "$config_file" 2>/dev/null | cut -d':' -f2- | sed 's/^[[:space:]]*//'
+}
+
+# -----------------------------------------------------------------------------
+# Interactive Setup Wizard
+# -----------------------------------------------------------------------------
+
+run_setup() {
+    print_banner
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded \
+            --border-foreground 39 \
+            --padding "1 2" \
+            --margin "0 0 1 0" \
+            "Welcome to the APR Setup Wizard!" \
+            "" \
+            "This will help you configure a new revision workflow." \
+            "You'll specify your documents and review preferences."
+    else
+        echo -e "${CYAN}╭────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${CYAN}│${NC}  ${BOLD}Welcome to the APR Setup Wizard!${NC}                         ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}                                                            ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}  This will help you configure a new revision workflow.     ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC}  You'll specify your documents and review preferences.     ${CYAN}│${NC}"
+        echo -e "${CYAN}╰────────────────────────────────────────────────────────────╯${NC}"
+    fi
+    echo ""
+
+    ensure_config_dir
+
+    # Step 1: Workflow name
+    print_step 1 6 "Workflow name"
+    local workflow_name
+    workflow_name=$(input "Workflow name" "default")
+    echo ""
+
+    # Step 2: Project description
+    print_step 2 6 "Project description"
+    local description
+    description=$(input "Brief description" "Iterative specification refinement")
+    echo ""
+
+    # Step 3: README/Overview document
+    print_step 3 6 "README/Overview document"
+    print_info "Select the main README or overview document"
+    local readme_path
+    readme_path=$(file_picker "Select README file")
+    if [[ ! -f "$readme_path" ]]; then
+        print_error "File not found: $readme_path"
+        exit $EXIT_CONFIG_ERROR
+    fi
+    print_success "README: $readme_path"
+    echo ""
+
+    # Step 4: Specification document
+    print_step 4 6 "Specification document"
+    print_info "Select the main specification/plan document"
+    local spec_path
+    spec_path=$(file_picker "Select specification file")
+    if [[ ! -f "$spec_path" ]]; then
+        print_error "File not found: $spec_path"
+        exit $EXIT_CONFIG_ERROR
+    fi
+    print_success "Specification: $spec_path"
+    echo ""
+
+    # Step 5: Implementation document (optional)
+    print_step 5 6 "Implementation document (optional)"
+    local impl_path=""
+    if confirm "Do you have an implementation/reference document?"; then
+        impl_path=$(file_picker "Select implementation file")
+        if [[ -n "$impl_path" && ! -f "$impl_path" ]]; then
+            print_warning "File not found: $impl_path (skipping)"
+            impl_path=""
+        else
+            print_success "Implementation: $impl_path"
+        fi
+    fi
+    echo ""
+
+    # Step 6: Review preferences
+    print_step 6 6 "Review preferences"
+    local model
+    model=$(choose "Select GPT model for reviews:" \
+        "5.2 Thinking (Extended Reasoning)" \
+        "gpt-5.2-pro" \
+        "gpt-5.2")
+
+    # Extract model name
+    case "$model" in
+        "5.2 Thinking"*) model="5.2 Thinking" ;;
+        *) ;;
+    esac
+
+    echo ""
+
+    # Create workflow directory and config
+    local workflow_dir="$CONFIG_DIR/workflows"
+    mkdir -p "$workflow_dir"
+    mkdir -p "$CONFIG_DIR/rounds/$workflow_name"
+
+    # Write config file
+    cat > "$workflow_dir/$workflow_name.yaml" << EOF
+# APR Workflow Configuration
+# Generated: $(date -Iseconds)
+
+name: $workflow_name
+description: $description
+
+documents:
+  readme: $readme_path
+  spec: $spec_path
+  implementation: ${impl_path:-""}
+
+oracle:
+  model: "$model"
+  thinking_time: heavy
+
+rounds:
+  output_dir: $CONFIG_DIR/rounds/$workflow_name
+
+template: |
+  First, read this README:
+
+  \`\`\`
+  <contents of README will be included by oracle>
+  \`\`\`
+
+  ---
+
+  NOW: Carefully review this entire plan for me and come up with your best
+  revisions in terms of better architecture, new features, changed features,
+  etc. to make it better, more robust/reliable, more performant, more
+  compelling/useful, etc.
+
+  For each proposed change, give me your detailed analysis and
+  rationale/justification for why it would make the project better along
+  with the git-diff style change versus the original plan shown below:
+
+  \`\`\`
+  <contents of spec will be included by oracle>
+  \`\`\`
+EOF
+
+    # Create default config if this is the first workflow
+    if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
+        cat > "$CONFIG_DIR/config.yaml" << EOF
+# APR Global Configuration
+default_workflow: $workflow_name
+EOF
+    fi
+
+    echo ""
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded \
+            --border-foreground 82 \
+            --padding "1 2" \
+            "✓ Workflow '$workflow_name' created successfully!" \
+            "" \
+            "To run your first revision round:" \
+            "  apr run 1" \
+            "" \
+            "To run with implementation doc:" \
+            "  apr run 1 --include-impl"
+    else
+        echo -e "${GREEN}╭────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${GREEN}│${NC}  ${BOLD}✓ Workflow '$workflow_name' created successfully!${NC}"
+        echo -e "${GREEN}│${NC}"
+        echo -e "${GREEN}│${NC}  To run your first revision round:"
+        echo -e "${GREEN}│${NC}    ${CYAN}apr run 1${NC}"
+        echo -e "${GREEN}│${NC}"
+        echo -e "${GREEN}│${NC}  To run with implementation doc:"
+        echo -e "${GREEN}│${NC}    ${CYAN}apr run 1 --include-impl${NC}"
+        echo -e "${GREEN}╰────────────────────────────────────────────────────────────╯${NC}"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Run Revision Round
+# -----------------------------------------------------------------------------
+
+run_round() {
+    local round_num="$1"
+    local workflow="${WORKFLOW:-default}"
+    local include_impl="${INCLUDE_IMPL:-false}"
+    local dry_run="${DRY_RUN:-false}"
+    local render="${RENDER:-false}"
+    local copy="${COPY:-false}"
+    local wait_mode="${WAIT_MODE:-false}"
+    local manual_login="${MANUAL_LOGIN:-false}"
+    local keep_browser="${KEEP_BROWSER:-false}"
+
+    print_banner
+
+    # Load workflow config
+    local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
+    if [[ ! -f "$config_path" ]]; then
+        print_error "Workflow '$workflow' not found"
+        print_info "Run 'apr setup' to create a new workflow"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    # Parse config (simple grep-based for now)
+    local readme_path spec_path impl_path model output_dir
+    readme_path=$(get_config_value "readme" "$config_path" | tr -d '"')
+    spec_path=$(get_config_value "spec" "$config_path" | tr -d '"')
+    impl_path=$(get_config_value "implementation" "$config_path" | tr -d '"')
+    model=$(get_config_value "model" "$config_path" | tr -d '"')
+    output_dir=$(get_config_value "output_dir" "$config_path" | tr -d '"')
+
+    # Validate files exist
+    for f in "$readme_path" "$spec_path"; do
+        if [[ ! -f "$f" ]]; then
+            print_error "Required file not found: $f"
+            exit $EXIT_CONFIG_ERROR
+        fi
+    done
+
+    if [[ "$include_impl" == "true" && -n "$impl_path" && ! -f "$impl_path" ]]; then
+        print_warning "Implementation file not found: $impl_path"
+        include_impl=false
+    fi
+
+    # Display round info
+    local slug="apr-${workflow}-round-${round_num}"
+    local output_file="${output_dir}/round_${round_num}.md"
+
+    if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
+        slug="${slug}-with-impl"
+    fi
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded \
+            --border-foreground 212 \
+            --padding "1 2" \
+            --margin "0 0 1 0" \
+            "$(gum style --foreground 212 --bold "REVISION ROUND $round_num")" \
+            "" \
+            "$(gum style --foreground 39 "Workflow:") $workflow" \
+            "$(gum style --foreground 39 "Model:") $model" \
+            "$(gum style --foreground 39 "Include impl:") $include_impl" \
+            "$(gum style --foreground 39 "Output:") $output_file"
+    else
+        echo -e "${MAGENTA}╭────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${MAGENTA}│${NC}  ${BOLD}REVISION ROUND $round_num${NC}"
+        echo -e "${MAGENTA}│${NC}"
+        echo -e "${MAGENTA}│${NC}  ${CYAN}Workflow:${NC}     $workflow"
+        echo -e "${MAGENTA}│${NC}  ${CYAN}Model:${NC}        $model"
+        echo -e "${MAGENTA}│${NC}  ${CYAN}Include impl:${NC} $include_impl"
+        echo -e "${MAGENTA}│${NC}  ${CYAN}Output:${NC}       $output_file"
+        echo -e "${MAGENTA}╰────────────────────────────────────────────────────────────╯${NC}"
+    fi
+    echo ""
+
+    # Build file arguments
+    local file_args=(--file "$readme_path")
+    if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
+        file_args+=(--file "$impl_path")
+    fi
+    file_args+=(--file "$spec_path")
+
+    # Build prompt
+    local prompt
+    prompt="First, read this README:
+
+\`\`\`
+<contents of README will be included by oracle>
+\`\`\`
+
+---
+"
+
+    if [[ "$include_impl" == "true" && -n "$impl_path" ]]; then
+        prompt+="
+And here is a document detailing the implementation; you should also keep
+the implementation in mind as you think about the specification, since
+ultimately the specification needs to be translated into code eventually!
+
+\`\`\`
+<contents of implementation will be included by oracle>
+\`\`\`
+
+---
+"
+    fi
+
+    prompt+="
+NOW: Carefully review this entire plan for me and come up with your best
+revisions in terms of better architecture, new features, changed features,
+etc. to make it better, more robust/reliable, more performant, more
+compelling/useful, etc.
+
+For each proposed change, give me your detailed analysis and
+rationale/justification for why it would make the project better along
+with the git-diff style change versus the original plan shown below:
+
+\`\`\`
+<contents of spec will be included by oracle>
+\`\`\`
+"
+
+    # Dry run mode
+    if [[ "$dry_run" == "true" ]]; then
+        print_header "DRY RUN"
+        echo ""
+        print_info "Would execute:"
+        echo ""
+        echo "  $ORACLE_CMD --engine browser \\"
+        echo "    -m \"$model\" \\"
+        for f in "${file_args[@]}"; do
+            echo "    $f \\"
+        done
+        echo "    --slug \"$slug\" \\"
+        echo "    --write-output \"$output_file\" \\"
+        [[ "$manual_login" == "true" ]] && echo "    --browser-manual-login \\"
+        [[ "$keep_browser" == "true" ]] && echo "    --browser-keep-browser \\"
+        echo "    --notify --heartbeat 30 \\"
+        echo "    -p \"<prompt>\""
+        exit $EXIT_SUCCESS
+    fi
+
+    # Render mode
+    if [[ "$render" == "true" ]]; then
+        local render_args=("--render")
+        [[ "$copy" == "true" ]] && render_args+=("--copy")
+
+        print_info "Rendering bundle for manual use..."
+        $ORACLE_CMD "${file_args[@]}" "${render_args[@]}" -p "$prompt"
+        exit $EXIT_SUCCESS
+    fi
+
+    # Build Oracle command
+    local oracle_args=(
+        --engine browser
+        -m "$model"
+        "${file_args[@]}"
+        --slug "$slug"
+        --write-output "$output_file"
+        --files-report
+        --notify
+        --heartbeat 30
+    )
+
+    [[ "$manual_login" == "true" ]] && oracle_args+=(--browser-manual-login)
+    [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
+    oracle_args+=(-p "$prompt")
+
+    # Create output directory
+    mkdir -p "$(dirname "$output_file")"
+
+    # Execute
+    print_info "Starting GPT Pro Extended Reasoning review..."
+    print_dim "This may take 10-60 minutes depending on complexity."
+    echo ""
+
+    if [[ "$manual_login" == "true" ]]; then
+        print_warning "Manual login mode enabled"
+        print_dim "Chrome will open - log into ChatGPT if prompted"
+        print_dim "Your session will be saved for future runs"
+        echo ""
+    fi
+
+    if [[ "$wait_mode" == "true" ]]; then
+        print_info "Running in foreground (--wait)..."
+        echo ""
+        $ORACLE_CMD "${oracle_args[@]}"
+        echo ""
+        print_success "Review complete!"
+        print_info "Output saved to: $output_file"
+    else
+        $ORACLE_CMD "${oracle_args[@]}" &
+        local oracle_pid=$!
+
+        print_success "Oracle running in background (PID: $oracle_pid)"
+        echo ""
+
+        if [[ "$GUM_AVAILABLE" == "true" ]]; then
+            gum style \
+                --border rounded \
+                --border-foreground 39 \
+                --padding "1 2" \
+                "$(gum style --foreground 214 --bold "MONITORING COMMANDS")" \
+                "" \
+                "Check status:      $(gum style --foreground 82 "apr status")" \
+                "Attach to session: $(gum style --foreground 82 "apr attach $slug")" \
+                "View with output:  $(gum style --foreground 82 "$ORACLE_CMD session $slug --render")"
+        else
+            echo -e "${CYAN}╭────────────────────────────────────────────────────────────╮${NC}"
+            echo -e "${CYAN}│${NC}  ${BOLD}MONITORING COMMANDS${NC}"
+            echo -e "${CYAN}├────────────────────────────────────────────────────────────┤${NC}"
+            echo -e "${CYAN}│${NC}  Check status:      ${GREEN}apr status${NC}"
+            echo -e "${CYAN}│${NC}  Attach to session: ${GREEN}apr attach $slug${NC}"
+            echo -e "${CYAN}│${NC}  View with output:  ${GREEN}$ORACLE_CMD session $slug --render${NC}"
+            echo -e "${CYAN}╰────────────────────────────────────────────────────────────╯${NC}"
+        fi
+
+        echo ""
+        print_info "Output will be saved to: $output_file"
+    fi
+
+    echo ""
+    print_header "NEXT STEPS AFTER REVIEW COMPLETES"
+    echo "1. Review the output in $output_file"
+    echo "2. Integrate feedback into your specification"
+    echo "3. Update README to reflect changes"
+    echo "4. Harmonize implementation doc (if applicable)"
+    echo "5. Commit and push"
+}
+
+# -----------------------------------------------------------------------------
+# Status & Session Management
+# -----------------------------------------------------------------------------
+
+show_status() {
+    print_banner
+    print_header "ORACLE SESSION STATUS"
+    echo ""
+    $ORACLE_CMD status --hours 72
+}
+
+attach_session() {
+    local session="$1"
+    print_banner
+    print_info "Attaching to session: $session"
+    echo ""
+    $ORACLE_CMD session "$session" --render
+}
+
+# -----------------------------------------------------------------------------
+# List Workflows
+# -----------------------------------------------------------------------------
+
+list_workflows() {
+    print_banner
+    print_header "CONFIGURED WORKFLOWS"
+    echo ""
+
+    local workflow_dir="$CONFIG_DIR/workflows"
+    if [[ ! -d "$workflow_dir" ]]; then
+        print_warning "No workflows configured yet"
+        print_info "Run 'apr setup' to create your first workflow"
+        exit $EXIT_SUCCESS
+    fi
+
+    for config in "$workflow_dir"/*.yaml; do
+        [[ -f "$config" ]] || continue
+        local name desc
+        name=$(basename "$config" .yaml)
+        desc=$(get_config_value "description" "$config")
+
+        if [[ "$GUM_AVAILABLE" == "true" ]]; then
+            gum style --foreground 82 --bold "$name"
+            gum style --faint "  $desc"
+        else
+            echo -e "  ${GREEN}${BOLD}$name${NC}"
+            echo -e "    ${DIM}$desc${NC}"
+        fi
+        echo ""
+    done
+}
+
+# -----------------------------------------------------------------------------
+# History
+# -----------------------------------------------------------------------------
+
+show_history() {
+    local workflow="${WORKFLOW:-default}"
+    print_banner
+    print_header "REVISION HISTORY: $workflow"
+    echo ""
+
+    local rounds_dir="$CONFIG_DIR/rounds/$workflow"
+    if [[ ! -d "$rounds_dir" ]]; then
+        print_warning "No rounds recorded for workflow '$workflow'"
+        exit $EXIT_SUCCESS
+    fi
+
+    for round_file in "$rounds_dir"/round_*.md; do
+        [[ -f "$round_file" ]] || continue
+        local round_num size date
+        round_num=$(basename "$round_file" .md | sed 's/round_//')
+        size=$(du -h "$round_file" | cut -f1)
+        date=$(stat -c %y "$round_file" 2>/dev/null || stat -f %Sm "$round_file" 2>/dev/null)
+
+        echo -e "  ${CYAN}Round $round_num${NC}  ${DIM}$size${NC}  ${DIM}$date${NC}"
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+
+show_help() {
+    check_gum || true
+    print_banner
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --foreground 214 --bold "SYNOPSIS"
+        echo "  apr [command] [options]"
+        echo ""
+
+        gum style --foreground 214 --bold "COMMANDS"
+        echo "  $(gum style --foreground 82 'run <round>')        Run a revision round"
+        echo "  $(gum style --foreground 82 'setup')              Interactive workflow setup wizard"
+        echo "  $(gum style --foreground 82 'status')             Check Oracle session status"
+        echo "  $(gum style --foreground 82 'attach <session>')   Attach to running/completed session"
+        echo "  $(gum style --foreground 82 'list')               List configured workflows"
+        echo "  $(gum style --foreground 82 'history')            Show revision history"
+        echo "  $(gum style --foreground 82 'help')               Show this help message"
+        echo ""
+
+        gum style --foreground 214 --bold "OPTIONS"
+        gum style --faint "  -w, --workflow NAME  Workflow to use (default: from config)"
+        gum style --faint "  -i, --include-impl   Include implementation document"
+        gum style --faint "  -d, --dry-run        Preview without sending to GPT Pro"
+        gum style --faint "  -r, --render         Render bundle for manual paste"
+        gum style --faint "  -c, --copy           Copy rendered bundle to clipboard"
+        gum style --faint "  --wait               Wait for completion (blocking)"
+        gum style --faint "  --login              Manual login mode (first-time setup)"
+        gum style --faint "  --keep-browser       Keep browser open after completion"
+        gum style --faint "  --version            Show version"
+        echo ""
+
+        gum style --foreground 214 --bold "EXAMPLES"
+        gum style --foreground 39 "  # First-time setup"
+        echo "  apr setup"
+        echo ""
+        gum style --foreground 39 "  # Run revision round 1"
+        echo "  apr run 1"
+        echo ""
+        gum style --foreground 39 "  # Run with implementation doc"
+        echo "  apr run 2 --include-impl"
+        echo ""
+        gum style --foreground 39 "  # First run with manual login"
+        echo "  apr run 1 --login --wait"
+        echo ""
+        gum style --foreground 39 "  # Check session status"
+        echo "  apr status"
+    else
+        echo -e "${BOLD}${YELLOW}SYNOPSIS${NC}"
+        echo "  apr [command] [options]"
+        echo ""
+        echo -e "${BOLD}${YELLOW}COMMANDS${NC}"
+        echo -e "  ${GREEN}run <round>${NC}        Run a revision round"
+        echo -e "  ${GREEN}setup${NC}              Interactive workflow setup wizard"
+        echo -e "  ${GREEN}status${NC}             Check Oracle session status"
+        echo -e "  ${GREEN}attach <session>${NC}   Attach to running/completed session"
+        echo -e "  ${GREEN}list${NC}               List configured workflows"
+        echo -e "  ${GREEN}history${NC}            Show revision history"
+        echo -e "  ${GREEN}help${NC}               Show this help message"
+        echo ""
+        echo -e "${BOLD}${YELLOW}OPTIONS${NC}"
+        echo "  -w, --workflow NAME  Workflow to use (default: from config)"
+        echo "  -i, --include-impl   Include implementation document"
+        echo "  -d, --dry-run        Preview without sending to GPT Pro"
+        echo "  -r, --render         Render bundle for manual paste"
+        echo "  -c, --copy           Copy rendered bundle to clipboard"
+        echo "  --wait               Wait for completion (blocking)"
+        echo "  --login              Manual login mode (first-time setup)"
+        echo "  --keep-browser       Keep browser open after completion"
+        echo "  --version            Show version"
+        echo ""
+        echo -e "${BOLD}${YELLOW}EXAMPLES${NC}"
+        echo "  apr setup                    # First-time setup"
+        echo "  apr run 1                    # Run revision round 1"
+        echo "  apr run 2 --include-impl     # Include implementation doc"
+        echo "  apr run 1 --login --wait     # First run with manual login"
+        echo "  apr status                   # Check session status"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    # Handle --version and --help early (before gum/oracle checks)
+    if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+        echo "apr version $VERSION"
+        exit $EXIT_SUCCESS
+    fi
+
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        check_gum || true
+        show_help
+        exit $EXIT_SUCCESS
+    fi
+
+    # Initialize gum
+    check_gum || true
+
+    # Check Oracle availability
+    if ! check_oracle; then
+        print_error "Oracle not found"
+        print_info "Install with: npm install -g @steipete/oracle"
+        print_info "Or ensure npx is available"
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+
+    # Parse command and options
+    local command="${1:-help}"
+    shift || true
+
+    # Global options
+    WORKFLOW=""
+    INCLUDE_IMPL=false
+    DRY_RUN=false
+    RENDER=false
+    COPY=false
+    WAIT_MODE=false
+    MANUAL_LOGIN=false
+    KEEP_BROWSER=false
+    VERBOSE=false
+
+    local positional_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -w|--workflow)
+                WORKFLOW="$2"
+                shift 2
+                ;;
+            -i|--include-impl)
+                INCLUDE_IMPL=true
+                shift
+                ;;
+            -d|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -r|--render)
+                RENDER=true
+                shift
+                ;;
+            -c|--copy)
+                COPY=true
+                shift
+                ;;
+            --wait)
+                WAIT_MODE=true
+                shift
+                ;;
+            --login)
+                MANUAL_LOGIN=true
+                shift
+                ;;
+            --keep-browser)
+                KEEP_BROWSER=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --version)
+                echo "apr version $VERSION"
+                exit $EXIT_SUCCESS
+                ;;
+            --help|-h)
+                show_help
+                exit $EXIT_SUCCESS
+                ;;
+            -*)
+                print_error "Unknown option: $1"
+                show_help
+                exit $EXIT_USAGE_ERROR
+                ;;
+            *)
+                positional_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Set workflow default
+    if [[ -z "$WORKFLOW" && -f "$CONFIG_DIR/config.yaml" ]]; then
+        WORKFLOW=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml")
+    fi
+    WORKFLOW="${WORKFLOW:-default}"
+
+    # Execute command
+    case "$command" in
+        run)
+            if [[ ${#positional_args[@]} -lt 1 ]]; then
+                print_error "Round number required"
+                print_info "Usage: apr run <round_number>"
+                exit $EXIT_USAGE_ERROR
+            fi
+            run_round "${positional_args[0]}"
+            ;;
+        setup)
+            run_setup
+            ;;
+        status)
+            show_status
+            ;;
+        attach)
+            if [[ ${#positional_args[@]} -lt 1 ]]; then
+                print_error "Session ID/slug required"
+                print_info "Usage: apr attach <session>"
+                exit $EXIT_USAGE_ERROR
+            fi
+            attach_session "${positional_args[0]}"
+            ;;
+        list)
+            list_workflows
+            ;;
+        history)
+            show_history
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            # If command looks like a number, treat as round number
+            if [[ "$command" =~ ^[0-9]+$ ]]; then
+                run_round "$command"
+            else
+                print_error "Unknown command: $command"
+                show_help
+                exit $EXIT_USAGE_ERROR
+            fi
+            ;;
+    esac
+}
+
+main "$@"

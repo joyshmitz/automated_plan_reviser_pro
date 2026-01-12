@@ -1,0 +1,17 @@
+# APR runtime
+.apr/rounds/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Temporary
+*.tmp
+*.temp
