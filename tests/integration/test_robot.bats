@@ -143,6 +143,197 @@ teardown() {
 }
 
 # =============================================================================
+# Robot Show
+# =============================================================================
+
+@test "apr robot show: returns round content" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot" "# Round 1 Content\n\nThis is test content."
+
+    run "$APR_SCRIPT" robot show 1 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    assert_valid_json "$output"
+    assert_json_value "$output" ".ok" "true"
+    assert_json_value "$output" ".data.round" "1"
+    [[ "$output" == *"Round 1 Content"* ]]
+}
+
+@test "apr robot show: returns metadata" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot" "Hello World"
+
+    run "$APR_SCRIPT" robot show 1 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    # Should have stats
+    echo "$output" | jq -e '.data.stats.chars' >/dev/null
+    echo "$output" | jq -e '.data.stats.lines' >/dev/null
+    echo "$output" | jq -e '.data.path' >/dev/null
+}
+
+@test "apr robot show: returns not_found for missing round" {
+    setup_test_workflow "robot"
+
+    run "$APR_SCRIPT" robot show 99 -w robot
+
+    log_test_output "$output"
+
+    assert_failure
+    assert_valid_json "$output"
+    assert_json_value "$output" ".ok" "false"
+    assert_json_value "$output" ".code" "not_found"
+}
+
+# =============================================================================
+# Robot Diff
+# =============================================================================
+
+@test "apr robot diff: compares two rounds" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot" "Line 1\nLine 2"
+    create_mock_round 2 "robot" "Line 1\nLine 2\nLine 3"
+
+    run "$APR_SCRIPT" robot diff 2 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    assert_valid_json "$output"
+    assert_json_value "$output" ".ok" "true"
+    assert_json_value "$output" ".data.comparing.from" "1"
+    assert_json_value "$output" ".data.comparing.to" "2"
+}
+
+@test "apr robot diff: returns change stats" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot" "Original content"
+    create_mock_round 2 "robot" "Changed content\nNew line"
+
+    run "$APR_SCRIPT" robot diff 2 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    # Should have stats
+    echo "$output" | jq -e '.data.stats.before' >/dev/null
+    echo "$output" | jq -e '.data.stats.after' >/dev/null
+    echo "$output" | jq -e '.data.stats.changes' >/dev/null
+}
+
+@test "apr robot diff: explicit round comparison" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot"
+    create_mock_round 2 "robot"
+    create_mock_round 3 "robot"
+
+    run "$APR_SCRIPT" robot diff 3 1 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    assert_json_value "$output" ".data.comparing.from" "1"
+    assert_json_value "$output" ".data.comparing.to" "3"
+}
+
+@test "apr robot diff: fails for round 1 without comparison" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot"
+
+    run "$APR_SCRIPT" robot diff 1 -w robot
+
+    log_test_output "$output"
+
+    assert_failure
+    assert_json_value "$output" ".ok" "false"
+    assert_json_value "$output" ".code" "invalid_argument"
+}
+
+# =============================================================================
+# Robot Integrate
+# =============================================================================
+
+@test "apr robot integrate: returns integration prompt" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot" "# GPT Feedback\n\n- Suggestion 1\n- Suggestion 2"
+
+    run "$APR_SCRIPT" robot integrate 1 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    assert_valid_json "$output"
+    assert_json_value "$output" ".ok" "true"
+    assert_json_value "$output" ".data.round" "1"
+    # Should have prompt content
+    echo "$output" | jq -e '.data.prompt' >/dev/null
+}
+
+@test "apr robot integrate: prompt includes spec path" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot"
+
+    run "$APR_SCRIPT" robot integrate 1 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    assert_json_value "$output" ".data.spec_path" "SPEC.md"
+    [[ "$output" == *"specification"* ]] || [[ "$output" == *"SPEC.md"* ]]
+}
+
+@test "apr robot integrate: returns stats" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot" "Some content here"
+
+    run "$APR_SCRIPT" robot integrate 1 -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    # Should have size stats
+    echo "$output" | jq -e '.data.stats.round_chars' >/dev/null
+    echo "$output" | jq -e '.data.stats.prompt_chars' >/dev/null
+}
+
+@test "apr robot integrate: fails for missing round" {
+    setup_test_workflow "robot"
+
+    run "$APR_SCRIPT" robot integrate 99 -w robot
+
+    log_test_output "$output"
+
+    assert_failure
+    assert_json_value "$output" ".ok" "false"
+    assert_json_value "$output" ".code" "not_found"
+}
+
+# =============================================================================
+# Robot Stats with Data
+# =============================================================================
+
+@test "apr robot stats: returns metrics when available" {
+    setup_test_workflow "robot"
+    create_mock_round 1 "robot"
+    create_mock_round 2 "robot"
+    "$APR_SCRIPT" backfill -w robot
+
+    run "$APR_SCRIPT" robot stats -w robot
+
+    log_test_output "$output"
+
+    assert_success
+    assert_valid_json "$output"
+    assert_json_value "$output" ".ok" "true"
+    # Should have round data
+    echo "$output" | jq -e '.data.round_count' >/dev/null
+}
+
+# =============================================================================
 # Robot Help
 # =============================================================================
 
@@ -155,4 +346,16 @@ teardown() {
     assert_valid_json "$output"
     assert_json_value "$output" ".ok" "true"
     assert_json_value "$output" ".data.commands.status" "System overview (config, workflows, oracle)"
+}
+
+@test "apr robot help: includes new commands" {
+    run "$APR_SCRIPT" robot help
+
+    log_test_output "$output"
+
+    assert_success
+    # Should include show, diff, integrate
+    [[ "$output" == *"show"* ]]
+    [[ "$output" == *"diff"* ]]
+    [[ "$output" == *"integrate"* ]]
 }

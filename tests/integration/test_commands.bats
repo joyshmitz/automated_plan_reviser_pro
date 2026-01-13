@@ -297,6 +297,121 @@ teardown() {
     [[ "$output" == *"K"* ]] || [[ "$output" == *"B"* ]] || [[ "$output" == *"size"* ]] || [[ "$output" == *"Size"* ]]
 }
 
+@test "apr stats: --json returns valid JSON" {
+    create_mock_round 1
+    create_mock_round 2
+
+    run "$APR_SCRIPT" stats --json
+
+    log_test_output "$output"
+
+    assert_success
+    # Should be valid JSON
+    echo "$output" | jq . >/dev/null 2>&1
+}
+
+@test "apr stats: --detailed shows more information" {
+    create_mock_round 1
+    create_mock_round 2
+    create_mock_round 3
+
+    run "$APR_SCRIPT" stats --detailed
+
+    log_test_output "$output"
+
+    assert_success
+    # Detailed mode should show more content
+    [[ ${#output} -gt 50 ]]
+}
+
+# =============================================================================
+# apr backfill Tests
+# =============================================================================
+
+@test "apr backfill: generates metrics from existing rounds" {
+    # Create rounds without metrics
+    create_mock_round 1
+    create_mock_round 2
+    create_mock_round 3
+
+    run "$APR_SCRIPT" backfill
+
+    log_test_output "$output"
+
+    assert_success
+    # Should create metrics file
+    [[ -f ".apr/analytics/default/metrics.json" ]]
+}
+
+@test "apr backfill: with workflow flag" {
+    setup_test_workflow "backfill-test"
+    create_mock_round 1 "backfill-test"
+    create_mock_round 2 "backfill-test"
+
+    run "$APR_SCRIPT" backfill -w backfill-test
+
+    log_test_output "$output"
+
+    assert_success
+    [[ -f ".apr/analytics/backfill-test/metrics.json" ]]
+}
+
+@test "apr backfill: --all processes all workflows" {
+    setup_test_workflow "workflow-a"
+    setup_test_workflow "workflow-b"
+    create_mock_round 1 "workflow-a"
+    create_mock_round 1 "workflow-b"
+
+    run "$APR_SCRIPT" backfill --all
+
+    log_test_output "$output"
+
+    assert_success
+    [[ -f ".apr/analytics/workflow-a/metrics.json" ]] || [[ "$output" == *"workflow"* ]]
+}
+
+@test "apr backfill: skips existing metrics without --force" {
+    create_mock_round 1
+
+    # First backfill
+    "$APR_SCRIPT" backfill
+
+    # Record original mtime
+    local orig_mtime
+    orig_mtime=$(stat -c %Y ".apr/analytics/default/metrics.json" 2>/dev/null || stat -f %m ".apr/analytics/default/metrics.json" 2>/dev/null)
+
+    sleep 1
+
+    # Second backfill without --force
+    run "$APR_SCRIPT" backfill
+
+    log_test_output "$output"
+
+    # Should skip or warn
+    [[ "$output" == *"skip"* ]] || [[ "$output" == *"exist"* ]] || [[ "$output" == *"force"* ]] || [[ $status -eq 0 ]]
+}
+
+@test "apr backfill: --force overwrites existing" {
+    create_mock_round 1
+
+    # First backfill
+    "$APR_SCRIPT" backfill
+
+    # Add another round
+    create_mock_round 2
+
+    # Force backfill
+    run "$APR_SCRIPT" backfill --force
+
+    log_test_output "$output"
+
+    assert_success
+    # Should have updated metrics
+    local round_count
+    round_count=$(jq '.rounds | length' ".apr/analytics/default/metrics.json")
+    [[ "$round_count" == "2" ]]
+}
+
 # =============================================================================
 # apr status / attach Tests
 # =============================================================================

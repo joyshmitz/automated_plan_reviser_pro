@@ -24,6 +24,7 @@
 #   attach <session>   Attach to a running/completed session
 #   list               List all configured workflows
 #   history            Show revision history for current workflow
+#   dashboard          Interactive analytics dashboard (TUI)
 #   backfill           Generate metrics from existing rounds
 #   update             Check for and install updates
 #   help               Show help message
@@ -3722,100 +3723,296 @@ dashboard_clear() {
     fi
 }
 
-dashboard_round_list() {
-    local workflow="$1"
-    local rounds=()
-
-    if command -v jq &>/dev/null; then
-        local metrics=""
-        metrics=$(metrics_read "$workflow" 2>/dev/null || echo "")
-        if [[ -n "$metrics" ]]; then
-            mapfile -t rounds < <(echo "$metrics" | jq -r '.rounds | sort_by(.round) | .[].round' 2>/dev/null || true)
-        fi
-    fi
-
-    if [[ ${#rounds[@]} -eq 0 ]]; then
-        local rounds_dir="$CONFIG_DIR/rounds/$workflow"
-        if [[ -d "$rounds_dir" ]]; then
-            local round_file round_num
-            for round_file in "$rounds_dir"/round_*.md; do
-                [[ -f "$round_file" ]] || continue
-                round_num=$(basename "$round_file" .md | sed 's/round_//')
-                if [[ "$round_num" =~ ^[0-9]+$ ]]; then
-                    rounds+=("$round_num")
-                fi
-            done
-            if [[ ${#rounds[@]} -gt 0 ]]; then
-                mapfile -t rounds < <(printf '%s\n' "${rounds[@]}" | sort -n -u)
-            fi
-        fi
-    fi
-
-    printf '%s\n' "${rounds[@]}"
+dashboard_term_size() {
+    local cols rows
+    cols=$(tput cols 2>/dev/null || echo "80")
+    rows=$(tput lines 2>/dev/null || echo "24")
+    echo "$cols $rows"
 }
 
-dashboard_select_round() {
-    local workflow="$1"
-    local prompt="${2:-Select round}"
-    local rounds=()
-    mapfile -t rounds < <(dashboard_round_list "$workflow")
+dashboard_iso_to_epoch() {
+    local iso="$1"
+    if [[ -z "$iso" || "$iso" == "null" ]]; then
+        echo "0"
+        return 0
+    fi
+    local epoch=""
+    epoch=$(date -d "$iso" +%s 2>/dev/null || true)
+    if [[ -n "$epoch" ]]; then
+        echo "$epoch"
+        return 0
+    fi
+    epoch=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$iso" +%s 2>/dev/null || true)
+    echo "${epoch:-0}"
+}
 
-    if [[ ${#rounds[@]} -eq 0 ]]; then
-        print_warning "No rounds found for workflow '$workflow'"
-        return 1
+dashboard_format_duration() {
+    local seconds="${1:-0}"
+    if [[ -z "$seconds" || "$seconds" == "null" || "$seconds" -lt 0 ]]; then
+        echo "N/A"
+        return 0
     fi
 
-    local choice=""
-    if [[ "$GUM_AVAILABLE" == "true" && -t 2 ]]; then
-        choice=$(printf '%s\n' "${rounds[@]}" | gum choose --header "$prompt")
+    local days=$((seconds / 86400))
+    local hours=$(( (seconds % 86400) / 3600 ))
+    local mins=$(( (seconds % 3600) / 60 ))
+
+    if (( days > 0 )); then
+        echo "${days}d ${hours}h"
+    elif (( hours > 0 )); then
+        echo "${hours}h ${mins}m"
     else
-        echo "Available rounds: ${rounds[*]}" >&2
-        read -rp "$prompt: " choice
+        echo "${mins}m"
+    fi
+}
+
+dashboard_hide_cursor() {
+    printf '\033[?25l' >&2
+}
+
+dashboard_show_cursor() {
+    printf '\033[?25h' >&2
+}
+
+dashboard_build_rounds() {
+    local metrics="$1"
+
+    DASHBOARD_ROUND_NUMS=()
+    DASHBOARD_ROUND_SIZES=()
+    DASHBOARD_ROUND_ADDED=()
+    DASHBOARD_ROUND_DELETED=()
+    DASHBOARD_ROUND_SIMILARITY=()
+    DASHBOARD_ROUND_TS=()
+
+    local line
+    while IFS=$'\t' read -r round_num size added deleted similarity timestamp; do
+        [[ -n "$round_num" ]] || continue
+        DASHBOARD_ROUND_NUMS+=("$round_num")
+        DASHBOARD_ROUND_SIZES+=("${size:-0}")
+        DASHBOARD_ROUND_ADDED+=("${added:-}")
+        DASHBOARD_ROUND_DELETED+=("${deleted:-}")
+        DASHBOARD_ROUND_SIMILARITY+=("${similarity:-}")
+        DASHBOARD_ROUND_TS+=("${timestamp:-}")
+    done < <(echo "$metrics" | jq -r \
+        '.rounds | sort_by(.round) | .[] | [.round, (.output.char_count // 0), (.changes_from_previous.lines_added // null), (.changes_from_previous.lines_deleted // null), (.changes_from_previous.similarity_score // null), (.timestamp // "")] | @tsv' 2>/dev/null)
+
+    DASHBOARD_TOTAL_ROUNDS=${#DASHBOARD_ROUND_NUMS[@]}
+}
+
+dashboard_render_header() {
+    local workflow="$1"
+    printf "%sAPR Analytics Dashboard%s - workflow: %s\n" "${BOLD}" "${NC}" "$workflow" >&2
+    printf "Press 'q' to quit, '?' for help, 'r' to refresh\n" >&2
+    printf "────────────────────────────────────────────────────────────────────────\n" >&2
+}
+
+dashboard_render_convergence() {
+    local metrics="$1"
+    local confidence
+    confidence=$(echo "$metrics" | jq -r '.convergence.confidence // 0' 2>/dev/null || echo "0")
+    local indicator
+    indicator=$(get_convergence_indicator "$confidence")
+
+    local percent
+    percent=$(awk -v c="$confidence" 'BEGIN { printf "%d", c*100 }' 2>/dev/null || echo "0")
+
+    local status="Diverging"
+    if (( percent >= 90 )); then
+        status="Converged"
+    elif (( percent >= 75 )); then
+        status="Nearly Converged"
+    elif (( percent >= 50 )); then
+        status="Approaching Convergence"
     fi
 
-    if [[ -z "$choice" ]]; then
-        return 1
+    local remaining
+    remaining=$(echo "$metrics" | jq -r '.convergence.estimated_rounds_remaining // ""' 2>/dev/null || echo "")
+    if [[ -z "$remaining" || "$remaining" == "null" ]]; then
+        remaining="?"
     fi
 
-    local valid=false
-    local round_value
-    for round_value in "${rounds[@]}"; do
-        if [[ "$choice" == "$round_value" ]]; then
-            valid=true
-            break
-        fi
+    printf "CONVERGENCE STATUS\n" >&2
+    printf "  %s %s%% - %s\n" "$indicator" "$percent" "$status" >&2
+    printf "  Est. %s more rounds\n" "$remaining" >&2
+    printf "\n" >&2
+}
+
+dashboard_render_quick_stats() {
+    local metrics="$1"
+
+    local round_count
+    round_count=$(echo "$metrics" | jq -r '.rounds | length' 2>/dev/null || echo "0")
+
+    local avg_size
+    avg_size=$(echo "$metrics" | jq -r '[.rounds[].output.char_count // 0] | if length > 0 then ((add / length) | floor) else 0 end' 2>/dev/null || echo "0")
+
+    local last_ts first_ts
+    last_ts=$(echo "$metrics" | jq -r '.rounds | sort_by(.round) | .[-1].timestamp // ""' 2>/dev/null || echo "")
+    first_ts=$(echo "$metrics" | jq -r '.rounds | sort_by(.round) | .[0].timestamp // ""' 2>/dev/null || echo "")
+
+    local last_epoch first_epoch span_secs
+    last_epoch=$(dashboard_iso_to_epoch "$last_ts")
+    first_epoch=$(dashboard_iso_to_epoch "$first_ts")
+    span_secs=$((last_epoch - first_epoch))
+    (( span_secs < 0 )) && span_secs=0
+
+    local total_span last_run
+    total_span=$(dashboard_format_duration "$span_secs")
+    last_run=$(format_iso_date "$last_ts")
+
+    printf "QUICK STATS\n" >&2
+    printf "  Rounds:     %s\n" "$round_count" >&2
+    printf "  Avg Size:   %s\n" "$(format_bytes "$avg_size")" >&2
+    printf "  Total Span: %s\n" "$total_span" >&2
+    printf "  Last Run:   %s\n" "$last_run" >&2
+    printf "\n" >&2
+}
+
+dashboard_render_bar_chart() {
+    local -a values=("$@")
+    local count=${#values[@]}
+    if [[ $count -eq 0 ]]; then
+        printf "OUTPUT SIZE TREND\n  (no data)\n\n" >&2
+        return 0
+    fi
+
+    local max_val=${values[0]}
+    local v
+    for v in "${values[@]}"; do
+        (( v > max_val )) && max_val=$v
     done
+    (( max_val <= 0 )) && max_val=1
 
-    if [[ "$valid" != "true" ]]; then
-        print_warning "Invalid round selection: $choice"
-        return 1
-    fi
+    local max_height=5
 
-    printf '%s\n' "$choice"
+    printf "OUTPUT SIZE TREND\n" >&2
+    for ((row=max_height; row>=1; row--)); do
+        local threshold=$((max_val * row / max_height))
+        printf "  " >&2
+        for v in "${values[@]}"; do
+            if (( v >= threshold )); then
+                printf "██" >&2
+            else
+                printf "  " >&2
+            fi
+            printf " " >&2
+        done
+        printf "\n" >&2
+    done
+    printf "  " >&2
+    local i
+    for ((i=1; i<=count; i++)); do
+        printf "R%-2d" "$i" >&2
+    done
+    printf "\n\n" >&2
 }
 
-dashboard_select_action() {
-    local action=""
-    if [[ "$GUM_AVAILABLE" == "true" && -t 2 ]]; then
-        action=$(printf '%s\n' "View round" "Diff with previous" "Refresh" "Quit" | gum choose --header "Dashboard actions")
-    else
-        echo "Actions: [v]iew round, [d]iff with previous, [r]efresh, [q]uit" >&2
-        read -rp "Choose action: " action
-        case "${action,,}" in
-            v|view) action="View round" ;;
-            d|diff) action="Diff with previous" ;;
-            r|refresh) action="Refresh" ;;
-            q|quit) action="Quit" ;;
-            *) action="" ;;
-        esac
+dashboard_render_round_table() {
+    local selected="$1"
+    local total="$2"
+    local max_rows=10
+    local start=0
+
+    if (( total > max_rows )); then
+        start=$((selected - max_rows / 2))
+        (( start < 0 )) && start=0
+        (( start > total - max_rows )) && start=$((total - max_rows))
     fi
 
-    if [[ -z "$action" ]]; then
-        print_warning "Unknown selection"
-        return 1
-    fi
+    local end=$((start + max_rows))
+    (( end > total )) && end=$total
 
-    printf '%s\n' "$action"
+    printf "ROUND DETAILS (use ↑/↓)\n" >&2
+    printf "  #   Output   +Add  -Del   Sim     Date\n" >&2
+    printf "  ─────────────────────────────────────────\n" >&2
+
+    local i
+    for ((i=start; i<end; i++)); do
+        local marker=" "
+        if [[ $i -eq $selected ]]; then
+            marker=">"
+        fi
+        local round_num size added deleted similarity ts
+        round_num="${DASHBOARD_ROUND_NUMS[$i]}"
+        size="$(format_bytes "${DASHBOARD_ROUND_SIZES[$i]}")"
+        added="${DASHBOARD_ROUND_ADDED[$i]}"
+        deleted="${DASHBOARD_ROUND_DELETED[$i]}"
+        similarity="$(format_float "${DASHBOARD_ROUND_SIMILARITY[$i]}")"
+        ts="$(format_iso_date "${DASHBOARD_ROUND_TS[$i]}")"
+
+        printf " %s %3s %7s %5s %5s %6s %10s\n" "$marker" "$round_num" "$size" \
+            "${added:-"-"}" "${deleted:-"-"}" "$similarity" "$ts" >&2
+    done
+    printf "\n" >&2
+    printf "Keys: Enter=details  d=diff  r=refresh  q=quit\n" >&2
+}
+
+dashboard_show_help() {
+    dashboard_clear
+    printf "APR DASHBOARD HELP\n" >&2
+    printf "──────────────────\n" >&2
+    printf "  q      Quit dashboard\n" >&2
+    printf "  ↑/↓    Navigate rounds\n" >&2
+    printf "  Enter  Show selected round details\n" >&2
+    printf "  d      Diff selected round with previous\n" >&2
+    printf "  r      Refresh metrics\n" >&2
+    printf "  ?      Show this help\n" >&2
+    printf "\nPress any key to return...\n" >&2
+    read -rsn1 _ </dev/tty
+}
+
+dashboard_show_round_detail() {
+    local idx="$1"
+    local workflow="$2"
+    local round_num="${DASHBOARD_ROUND_NUMS[$idx]}"
+    local size="${DASHBOARD_ROUND_SIZES[$idx]}"
+    local added="${DASHBOARD_ROUND_ADDED[$idx]}"
+    local deleted="${DASHBOARD_ROUND_DELETED[$idx]}"
+    local similarity="${DASHBOARD_ROUND_SIMILARITY[$idx]}"
+    local ts="${DASHBOARD_ROUND_TS[$idx]}"
+
+    dashboard_clear
+    printf "ROUND %s DETAILS (%s)\n" "$round_num" "$workflow" >&2
+    printf "──────────────────────────────\n" >&2
+    printf "Output size: %s\n" "$(format_bytes "$size")" >&2
+    printf "Lines added: %s\n" "${added:-"-"}" >&2
+    printf "Lines del:   %s\n" "${deleted:-"-"}" >&2
+    printf "Similarity:  %s\n" "$(format_float "$similarity")" >&2
+    printf "Timestamp:   %s\n" "$(format_iso_date "$ts")" >&2
+    printf "\nPress any key to return...\n" >&2
+    read -rsn1 _ </dev/tty
+}
+
+dashboard_handle_input() {
+    local key rest
+    read -rsn1 key </dev/tty
+    case "$key" in
+        $'\x1b')
+            read -rsn2 rest </dev/tty
+            case "$rest" in
+                '[A') echo "up" ;;
+                '[B') echo "down" ;;
+            esac
+            ;;
+        q|Q) echo "quit" ;;
+        r|R) echo "refresh" ;;
+        d|D) echo "diff" ;;
+        '?') echo "help" ;;
+        '') echo "detail" ;;
+    esac
+}
+
+dashboard_render() {
+    local workflow="$1"
+    local metrics="$2"
+    local selected="$3"
+
+    dashboard_clear
+    dashboard_render_header "$workflow"
+    dashboard_render_convergence "$metrics"
+    dashboard_render_quick_stats "$metrics"
+    dashboard_render_bar_chart "${DASHBOARD_ROUND_SIZES[@]}"
+    dashboard_render_round_table "$selected" "$DASHBOARD_TOTAL_ROUNDS"
 }
 
 show_dashboard() {
@@ -3828,13 +4025,11 @@ show_dashboard() {
         exit $EXIT_CONFIG_ERROR
     fi
 
-    if [[ ! -t 2 ]]; then
+    if [[ ! -t 0 || ! -t 2 ]]; then
         print_error "Dashboard requires an interactive terminal"
         print_info "Use 'apr stats' for non-interactive output"
         exit $EXIT_USAGE_ERROR
     fi
-
-    check_gum || true
 
     if ! command -v jq &>/dev/null; then
         print_error "jq not available; dashboard requires jq"
@@ -3842,36 +4037,64 @@ show_dashboard() {
         exit $EXIT_DEPENDENCY_ERROR
     fi
 
+    if ! metrics_exists "$workflow"; then
+        print_error "No analytics data for workflow '$workflow'"
+        print_info "Run some rounds or 'apr backfill' first"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    local cols rows
+    read -r cols rows < <(dashboard_term_size)
+    if (( cols < 80 || rows < 24 )); then
+        print_error "Terminal too small for dashboard (${cols}x${rows})"
+        print_info "Resize to at least 80x24 and try again"
+        exit $EXIT_USAGE_ERROR
+    fi
+
+    local selected=0
+    local metrics
+
+    dashboard_hide_cursor
+    trap 'dashboard_show_cursor; dashboard_clear' EXIT
+
     while true; do
-        dashboard_clear
-        if ! show_stats_full "$workflow"; then
-            print_warning "Unable to load analytics data"
-            print_info "Try 'apr backfill' or run more rounds"
+        metrics=$(metrics_read "$workflow") || exit $EXIT_CONFIG_ERROR
+        dashboard_build_rounds "$metrics"
+
+        if (( DASHBOARD_TOTAL_ROUNDS <= 0 )); then
+            dashboard_clear
+            print_warning "No rounds in metrics for workflow '$workflow'"
+            print_info "Run 'apr run 1' or 'apr backfill' first"
+            break
         fi
 
-        echo "" >&2
-        print_header "DASHBOARD ACTIONS"
-        local action
-        action=$(dashboard_select_action) || continue
+        if (( selected >= DASHBOARD_TOTAL_ROUNDS )); then
+            selected=$((DASHBOARD_TOTAL_ROUNDS - 1))
+        fi
+        (( selected < 0 )) && selected=0
 
-        case "$action" in
-            "View round")
-                local round
-                round=$(dashboard_select_round "$workflow" "Select round to view") || continue
-                show_round "$round"
-                ;;
-            "Diff with previous")
-                local round
-                round=$(dashboard_select_round "$workflow" "Select round to diff") || continue
-                if [[ "$round" -le 1 ]]; then
-                    print_warning "Round 1 has no previous round to diff"
-                    continue
+        dashboard_render "$workflow" "$metrics" "$selected"
+
+        case "$(dashboard_handle_input)" in
+            up) ((selected--)) ;;
+            down) ((selected++)) ;;
+            diff)
+                if (( selected >= 1 )); then
+                    dashboard_clear
+                    diff_rounds "${DASHBOARD_ROUND_NUMS[$selected]}" "${DASHBOARD_ROUND_NUMS[$((selected - 1))]}"
+                    print_dim "Press any key to return..." >&2
+                    read -rsn1 _ </dev/tty
                 fi
-                diff_rounds "$round"
                 ;;
-            "Refresh")
+            detail)
+                dashboard_show_round_detail "$selected" "$workflow"
                 ;;
-            "Quit")
+            help)
+                dashboard_show_help
+                ;;
+            refresh)
+                ;;
+            quit)
                 break
                 ;;
         esac
