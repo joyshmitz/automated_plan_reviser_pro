@@ -24,6 +24,7 @@
 #   attach <session>   Attach to a running/completed session
 #   list               List all configured workflows
 #   history            Show revision history for current workflow
+#   backfill           Generate metrics from existing rounds
 #   update             Check for and install updates
 #   help               Show help message
 #
@@ -4901,6 +4902,9 @@ main() {
             ;;
         stats)
             show_stats
+            ;;
+        backfill)
+            cmd_backfill "${positional_args[@]}"
             ;;
         update)
             cmd_update
