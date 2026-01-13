@@ -1240,12 +1240,32 @@ run_round() {
     model=$(get_config_value "model" "$config_path" | tr -d '"')
     output_dir=$(get_config_value "output_dir" "$config_path" | tr -d '"')
 
+    local config_errors=()
+    [[ -z "$model" ]] && config_errors+=("Model not configured in workflow")
+    [[ -z "$output_dir" ]] && config_errors+=("Output directory not configured in workflow")
+    if [[ ${#config_errors[@]} -gt 0 ]]; then
+        local errors_json
+        errors_json=$(printf '%s\n' "${config_errors[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+        robot_json false "validation_failed" "$(jq -nc --argjson errors "$errors_json" '{errors: $errors}')" \
+            "Fix workflow configuration before running"
+        return 1
+    fi
+
     verbose "Config parsed:"
     verbose "  README: $readme_path"
     verbose "  Spec: $spec_path"
     verbose "  Implementation: ${impl_path:-<not configured>}"
     verbose "  Model: $model"
     verbose "  Output dir: $output_dir"
+
+    if [[ -z "$model" ]]; then
+        print_error "Model not configured in $config_path"
+        exit $EXIT_CONFIG_ERROR
+    fi
+    if [[ -z "$output_dir" ]]; then
+        print_error "Output directory not configured in $config_path"
+        exit $EXIT_CONFIG_ERROR
+    fi
 
     # Run pre-flight checks (unless skipped or dry-run/render mode)
     if [[ "$skip_preflight" != "true" && "$dry_run" != "true" && "$render" != "true" ]]; then
@@ -1822,6 +1842,12 @@ generate_integration() {
     local spec_path
     spec_path=$(get_config_value "spec" "$workflow_file" | tr -d '"')
 
+    if [[ -z "$spec_path" ]]; then
+        print_error "Spec path not configured in workflow '$workflow'"
+        print_info "Workflow file: $workflow_file"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
     local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
     if [[ ! -f "$round_file" ]]; then
         print_error "Round $round_num not found for workflow '$workflow'"
@@ -1926,7 +1952,14 @@ show_stats() {
     local round_data=()
     local sizes=()
 
-    for round_file in "$rounds_dir"/round_*.md; do
+    # Get round files sorted numerically (glob gives lexicographic: 1, 10, 11, 2, ...)
+    # We need numeric order for correct trend detection
+    local sorted_files=()
+    while IFS= read -r round_file; do
+        sorted_files+=("$round_file")
+    done < <(find "$rounds_dir" -maxdepth 1 -name "round_*.md" -type f 2>/dev/null | sort -t_ -k2 -n)
+
+    for round_file in "${sorted_files[@]}"; do
         [[ -f "$round_file" ]] || continue
         ((total_rounds++))
 
@@ -2221,15 +2254,23 @@ robot_validate() {
         errors+=("Workflow '$WORKFLOW' not found")
     else
         # Check required documents exist
-        local readme spec
+        local readme spec model output_dir
         readme=$(get_config_value "readme" "$wf_file" 2>/dev/null || echo "")
         spec=$(get_config_value "spec" "$wf_file" 2>/dev/null || echo "")
+        model=$(get_config_value "model" "$wf_file" 2>/dev/null || echo "")
+        output_dir=$(get_config_value "output_dir" "$wf_file" 2>/dev/null || echo "")
 
         if [[ -n "$readme" && ! -f "$readme" ]]; then
             errors+=("README not found: $readme")
         fi
         if [[ -n "$spec" && ! -f "$spec" ]]; then
             errors+=("Spec not found: $spec")
+        fi
+        if [[ -z "$model" ]]; then
+            errors+=("Model not configured in workflow")
+        fi
+        if [[ -z "$output_dir" ]]; then
+            errors+=("Output directory not configured in workflow")
         fi
     fi
 
