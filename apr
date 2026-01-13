@@ -1408,7 +1408,7 @@ metrics_init() {
         return 1
     }
 
-    metrics_write_atomic "$workflow" "$json"
+    metrics_write_file "$workflow" "$json"
 }
 
 # Backwards-compatible alias
@@ -1506,7 +1506,7 @@ metrics_migrate() {
         return 1
     }
 
-    metrics_write_atomic "$workflow" "$migrated_json"
+    metrics_write_file "$workflow" "$migrated_json"
 }
 
 metrics_read_round() {
@@ -1536,10 +1536,18 @@ metrics_write_round() {
         return 1
     fi
 
-    metrics_init "$workflow" || return 1
+    # Acquire lock for RMW cycle
+    metrics_lock "$workflow" || return 1
+
+    # Initialize if needed (inside lock)
+    if ! metrics_init "$workflow"; then
+        metrics_unlock "$workflow"
+        return 1
+    fi
 
     if ! echo "$round_json" | jq -e '.' >/dev/null 2>&1; then
         print_error "Round metrics JSON is invalid"
+        metrics_unlock "$workflow"
         return 1
     fi
 
@@ -1547,19 +1555,20 @@ metrics_write_round() {
     ts=$(iso_timestamp)
     normalized_round=$(echo "$round_json" | jq -c --argjson num "$round_num" '.round = $num')
 
-    merged=$(jq -c \
-        --argjson round "$normalized_round" \
-        --argjson num "$round_num" \
-        --arg ts "$ts" \
-        '
-        .rounds |= (map(select(.round != $num)) + [$round] | sort_by(.round))
-        | .updated_at = $ts
-        ' "$metrics_path") || {
-        print_error "Failed to write round metrics"
-        return 1
-    }
+    # Read current state (safe due to lock)
+    local current_json
+    current_json=$(cat "$metrics_path")
 
-    metrics_write_atomic "$workflow" "$merged"
+    merged=$(echo "$current_json" | jq -c --argjson round "$normalized_round" --argjson num "$round_num" --arg ts "$ts" '.rounds |= (map(select(.round != $num)) + [$round] | sort_by(.round)) | .updated_at = $ts')
+
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to merge round metrics"
+        metrics_unlock "$workflow"
+        return 1
+    fi
+
+    metrics_write_file "$workflow" "$merged"
+    metrics_unlock "$workflow"
     verbose "metrics_write_round: wrote round $round_num for workflow '$workflow'"
 }
 
@@ -1576,71 +1585,299 @@ metrics_write_convergence() {
         return 1
     fi
 
-    metrics_init "$workflow" || return 1
+    metrics_lock "$workflow" || return 1
+
+    if ! metrics_init "$workflow"; then
+        metrics_unlock "$workflow"
+        return 1
+    fi
 
     if ! echo "$convergence_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
         print_error "Convergence JSON must be an object"
+        metrics_unlock "$workflow"
         return 1
     fi
 
-    local ts merged
+    local ts merged current_json
     ts=$(iso_timestamp)
+    current_json=$(cat "$metrics_path")
 
-    merged=$(jq -c \
-        --argjson convergence "$convergence_json" \
-        --arg ts "$ts" \
-        '
-        .convergence = $convergence
-        | .updated_at = $ts
-        ' "$metrics_path") || {
-        print_error "Failed to write convergence metrics"
+    merged=$(echo "$current_json" | jq -c --argjson convergence "$convergence_json" --arg ts "$ts" '.convergence = $convergence | .updated_at = $ts')
+
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to merge convergence metrics"
+        metrics_unlock "$workflow"
         return 1
-    }
+    fi
 
-    metrics_write_atomic "$workflow" "$merged"
+    metrics_write_file "$workflow" "$merged"
+    metrics_unlock "$workflow"
     verbose "metrics_write_convergence: updated convergence for workflow '$workflow'"
 }
 
-metrics_write_atomic() {
+
+
+    
+
+
+
+        merged=$(echo "$current_json" | jq -c \
+
+
+
+            --argjson convergence "$convergence_json" \
+
+
+
+            --arg ts "$ts" \
+
+
+
+            '
+
+
+
+            .convergence = $convergence
+
+
+
+            | .updated_at = $ts
+
+
+
+            ')
+
+
+
+    
+
+
+
+        if [[ $? -ne 0 ]]; then
+
+
+
+            print_error "Failed to merge convergence metrics"
+
+
+
+            metrics_unlock "$workflow"
+
+
+
+            return 1
+
+
+
+        fi
+
+
+
+    
+
+
+
+        metrics_write_file "$workflow" "$merged"
+
+
+
+        metrics_unlock "$workflow"
+
+
+
+        verbose "metrics_write_convergence: updated convergence for workflow '$workflow'"
+
+
+
+    }
+
+
+
+# Internal: Write JSON to metrics file (atomic via rename)
+
+# Assumes lock is held by caller if used in RMW cycle.
+
+metrics_write_file() {
+
     local workflow="$1"
+
     local json_input="$2"
+
     local metrics_path metrics_dir_path
+
     metrics_path=$(metrics_file_path "$workflow")
+
     metrics_dir_path=$(metrics_dir "$workflow")
 
+
+
     if ! command -v jq &>/dev/null; then
+
         print_error "jq is required for analytics metrics"
+
         return 1
+
     fi
 
+
+
     if ! metrics_validate_json "$json_input"; then
+
         print_error "Refusing to write invalid metrics JSON"
+
         return 1
+
     fi
+
+
 
     mkdir -p "$metrics_dir_path"
 
-    local tmp_file=""
-    tmp_file=$(mktemp -p "$metrics_dir_path" "metrics.json.tmp.XXXXXX" 2>/dev/null \
-        || mktemp "${metrics_dir_path}/metrics.json.tmp.XXXXXX" 2>/dev/null \
-        || echo "")
-    if [[ -z "$tmp_file" ]]; then
+
+
+            local tmp_file=""
+
+
+
+            tmp_file=$(mktemp -p "$metrics_dir_path" "metrics.json.tmp.XXXXXX" 2>/dev/null || mktemp "${metrics_dir_path}/metrics.json.tmp.XXXXXX" 2>/dev/null || echo "")
+
+
+
+            if [[ -z "$tmp_file" ]]; then
+
         print_error "Failed to create temporary file for metrics"
+
         return 1
+
     fi
+
+
 
     if ! printf '%s\n' "$json_input" > "$tmp_file"; then
+
         print_error "Failed to write metrics temp file"
+
         rm -f "$tmp_file" 2>/dev/null
+
         return 1
+
     fi
 
+
+
     if ! mv -f "$tmp_file" "$metrics_path"; then
+
         print_error "Failed to move metrics temp file into place"
+
         rm -f "$tmp_file" 2>/dev/null
+
         return 1
+
     fi
+
     verbose "Wrote metrics to $metrics_path"
+
+}
+
+
+
+# Locking helpers for metrics
+
+METRICS_LOCK_FD=""
+
+
+
+metrics_lock() {
+    local workflow="$1"
+    local metrics_dir_path
+    metrics_dir_path=$(metrics_dir "$workflow")
+
+    mkdir -p "$metrics_dir_path"
+
+
+
+    local lock_file="${metrics_dir_path}/.metrics.lock"
+
+
+
+    if command -v flock &>/dev/null; then
+
+        exec {METRICS_LOCK_FD}>"$lock_file"
+
+        if ! flock -x "$METRICS_LOCK_FD"; then
+
+            return 1
+
+        fi
+
+    else
+
+        # Fallback: simplistic spin lock (less robust but works for basic concurrency)
+
+        local retries=0
+
+        while ! (set -C; echo "$" > "$lock_file") 2>/dev/null; do
+
+            # Check for stale lock
+
+            local pid
+
+            pid=$(cat "$lock_file" 2>/dev/null || echo "")
+
+            if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+
+                rm -f "$lock_file" 2>/dev/null
+
+            fi
+
+            
+
+            sleep 0.1
+
+            ((retries++))
+
+            if (( retries > 50 )); then # 5 seconds
+
+                print_error "Failed to acquire metrics lock for $workflow"
+
+                return 1
+
+            fi
+
+        done
+
+    fi
+
+    return 0
+
+}
+
+
+
+metrics_unlock() {
+
+    local workflow="$1"
+
+    local metrics_dir_path
+
+    metrics_dir_path=$(metrics_dir "$workflow")
+
+    local lock_file="${metrics_dir_path}/.metrics.lock"
+
+
+
+    if [[ -n "$METRICS_LOCK_FD" ]]; then
+
+        exec {METRICS_LOCK_FD}>&-
+
+        METRICS_LOCK_FD=""
+
+    else
+
+        rm -f "$lock_file" 2>/dev/null
+
+    fi
+
 }
 
 # -----------------------------------------------------------------------------
@@ -4443,7 +4680,7 @@ backfill_workflow() {
         print_info "[DRY RUN] Would backfill workflow '$workflow'"
     else
         if metrics_exists "$workflow" && [[ "$force" == "true" ]]; then
-            metrics_write_atomic "$workflow" "$(metrics_default_json "$workflow")"
+            metrics_write_file "$workflow" "$(metrics_default_json "$workflow")"
         else
             metrics_init "$workflow"
         fi

@@ -1,19 +1,7 @@
 #!/usr/bin/env bats
 # test_config.bats - Unit tests for APR config parsing functions
-#
-# Tests:
-#   - get_config_value() - Simple YAML value extraction
-#   - get_yaml_block() - Block scalar extraction
-#   - load_prompt_template() - Template loading
-#   - load_config() - Config file resolution
-#   - ensure_config_dir() - Directory creation
 
-# Load test helpers
 load '../helpers/test_helper'
-
-# =============================================================================
-# Setup and Teardown
-# =============================================================================
 
 setup() {
     setup_test_environment
@@ -26,10 +14,6 @@ teardown() {
     teardown_test_environment
 }
 
-# =============================================================================
-# get_config_value() Tests
-# =============================================================================
-
 @test "get_config_value: extracts top-level key" {
     local config="$TEST_DIR/test.yaml"
     cat > "$config" << 'EOF'
@@ -37,12 +21,7 @@ name: test-workflow
 description: A test workflow
 EOF
 
-    log_test_input "config file" "$(cat "$config")"
-
     run get_config_value "name" "$config"
-
-    log_test_actual "output" "$output"
-
     assert_success
     assert_output "test-workflow"
 }
@@ -56,12 +35,7 @@ documents:
   spec: SPECIFICATION.md
 EOF
 
-    log_test_input "config file" "$(cat "$config")"
-
     run get_config_value "readme" "$config"
-
-    log_test_actual "output" "$output"
-
     assert_success
     assert_output "README.md"
 }
@@ -74,9 +48,6 @@ description: 'single quoted'
 EOF
 
     run get_config_value "name" "$config"
-
-    log_test_actual "output" "$output"
-
     assert_success
     # Should include or strip quotes depending on implementation
     [[ "$output" == "quoted value" || "$output" == '"quoted value"' ]]
@@ -89,9 +60,6 @@ name: test-workflow
 EOF
 
     run get_config_value "nonexistent" "$config"
-
-    log_test_actual "output" "$output"
-
     assert_success
     assert_output ""
 }
@@ -104,9 +72,6 @@ url: "https://example.com:8080/path"
 EOF
 
     run get_config_value "url" "$config"
-
-    log_test_actual "output" "$output"
-
     assert_success
     [[ "$output" == *"example.com"* ]]
 }
@@ -116,9 +81,6 @@ EOF
     touch "$config"
 
     run get_config_value "name" "$config"
-
-    log_test_actual "output" "$output"
-
     assert_success
     assert_output ""
 }

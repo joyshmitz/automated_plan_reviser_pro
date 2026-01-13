@@ -232,6 +232,7 @@ With each round, the specification becomes "less wrong." Not only is this a good
 - [Terminal Styling](#-terminal-styling)
 - [Dependencies](#-dependencies)
 - [Environment Variables](#-environment-variables)
+- [Oracle Remote Setup](#-oracle-remote-setup-headlessssh-environments)
 - [Troubleshooting](#-troubleshooting)
 - [Contributing](#-contributing)
 - [License](#-license)
@@ -1648,6 +1649,114 @@ sudo apt-get install jq
 | `NO_COLOR` | Disable colored output (accessibility) | unset |
 | `CI` | Detected CI environment (disables gum) | unset |
 | `PAGER` | Pager for `apr show` output | `less` or `more` |
+
+---
+
+## 🌐 Oracle Remote Setup (Headless/SSH Environments)
+
+If you're running APR on a headless server (SSH session, remote VM, CI runner), Oracle can't open a browser locally. The solution is **Oracle's serve mode**: run the browser automation on a local machine with a GUI, and have the remote server connect to it.
+
+### Why This Is Needed
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  THE PROBLEM                                                                  │
+│                                                                               │
+│  [Remote Server]                      [ChatGPT]                              │
+│       SSH ───────→ No browser ──────✕──→ Can't authenticate                  │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  THE SOLUTION: Oracle Serve Mode                                              │
+│                                                                               │
+│  [Remote Server]     [Local Machine]      [ChatGPT]                          │
+│       APR ──────────→ Oracle Serve ──────→ Browser ──────→ ✓                 │
+│              TCP/9333        ▲                                                │
+│              (Tailscale)     └── Has GUI, can run Chrome                     │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 1: Start Oracle Serve on Your Local Machine
+
+On the machine with a browser (your laptop, desktop, Mac Mini, etc.):
+
+```bash
+# Install Oracle if needed
+npm install -g @steipete/oracle
+
+# Start the server (keep this terminal open)
+oracle serve --port 9333 --token "your-secret-token"
+```
+
+**Important: Use port 9333, not 9222.** Port 9222 is used internally by Chrome for the DevTools Protocol. Using 9333 for Oracle's server avoids the conflict.
+
+You'll see output like:
+```
+Oracle remote server started on port 9333
+Waiting for connections...
+```
+
+### Step 2: Configure the Remote Server
+
+On your remote machine (the one running APR via SSH):
+
+```bash
+# Set environment variables (add to ~/.zshrc or ~/.bashrc for persistence)
+export ORACLE_REMOTE_HOST="192.168.1.100:9333"  # Your local machine's IP
+export ORACLE_REMOTE_TOKEN="your-secret-token"  # Must match --token above
+
+# Or for Tailscale (recommended for remote servers)
+export ORACLE_REMOTE_HOST="100.x.x.x:9333"      # Tailscale IP of local machine
+```
+
+### Step 3: Test the Connection
+
+```bash
+oracle -p "Say exactly: Connection successful" -e browser -m "5.2 Thinking"
+```
+
+If successful, you'll see GPT Pro's response. APR will now work normally:
+
+```bash
+apr run 1  # Works over the remote connection
+```
+
+### Tailscale Setup (Recommended)
+
+If your local and remote machines are both on a Tailscale network, use Tailscale IPs for reliable connectivity:
+
+```bash
+# Find your local machine's Tailscale IP
+tailscale ip -4  # Run this on your local machine
+
+# On the remote server
+export ORACLE_REMOTE_HOST="100.x.x.x:9333"  # Use the Tailscale IP
+export ORACLE_REMOTE_TOKEN="your-secret-token"
+
+# Verify connectivity
+tailscale ping 100.x.x.x  # Should succeed
+```
+
+Tailscale provides:
+- **NAT traversal**: Works even when your local machine is behind a firewall
+- **Encryption**: Traffic is encrypted via WireGuard
+- **Stable IPs**: Tailscale IPs don't change when you move networks
+
+### Session Persistence
+
+Once authenticated, Oracle maintains the ChatGPT session in the browser. You can:
+
+1. Leave `oracle serve` running on your local machine
+2. Run multiple APR rounds from the remote server
+3. Reattach to sessions: `apr attach <slug>`
+
+If the session expires, you may need to re-authenticate by visiting ChatGPT in the browser on your local machine.
+
+### Security Considerations
+
+- **Token secrecy**: The `--token` value is like a password. Use a strong, unique value.
+- **Network exposure**: Only expose `oracle serve` on trusted networks (Tailscale, local LAN).
+- **Don't use over public internet**: Without Tailscale, you'd need firewall rules and the connection isn't encrypted.
 
 ---
 
