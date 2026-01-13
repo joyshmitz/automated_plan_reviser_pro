@@ -302,23 +302,77 @@ gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
     return 1
 }
 
+install_node() {
+    if command -v node &> /dev/null && command -v npm &> /dev/null; then
+        log_info "Node.js already installed: $(node --version 2>/dev/null | head -1)"
+        return 0
+    fi
+
+    log_step "Installing Node.js (required for Oracle)..."
+
+    local os="unknown"
+    case "$(uname -s)" in
+        Darwin*) os="macos" ;;
+        Linux*)  os="linux" ;;
+    esac
+
+    case "$os" in
+        macos)
+            if command -v brew &> /dev/null; then
+                brew install node &>/dev/null && return 0
+            fi
+            ;;
+        linux)
+            if ! command -v sudo &> /dev/null; then
+                log_warn "sudo not available; cannot install Node.js automatically"
+                return 1
+            fi
+            if command -v apt-get &> /dev/null; then
+                if command -v curl &> /dev/null; then
+                    curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - &>/dev/null
+                    sudo apt-get install -y -qq nodejs &>/dev/null && return 0
+                else
+                    log_warn "curl not available; cannot install Node.js via NodeSource"
+                    return 1
+                fi
+            elif command -v dnf &> /dev/null; then
+                sudo dnf install -y nodejs &>/dev/null && return 0
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -S --noconfirm nodejs npm &>/dev/null && return 0
+            fi
+            ;;
+    esac
+
+    log_warn "Could not install Node.js automatically"
+    return 1
+}
+
 install_oracle() {
     if command -v oracle &> /dev/null; then
         log_info "Oracle already installed: $(oracle --version 2>/dev/null | head -1)"
         return 0
     fi
 
-    log_step "Checking Oracle availability..."
+    log_step "Ensuring Oracle is installed..."
 
-    if command -v npx &> /dev/null; then
-        log_info "Oracle available via npx"
-        log_info "For faster execution, install globally: npm install -g @steipete/oracle"
-        return 0
+    if ! command -v npm &> /dev/null; then
+        install_node || {
+            log_warn "Node.js not installed; cannot install Oracle automatically"
+            return 1
+        }
     fi
 
     if command -v npm &> /dev/null; then
         log_step "Installing Oracle globally..."
-        npm install -g @steipete/oracle && return 0
+        if npm install -g @steipete/oracle &>/dev/null; then
+            return 0
+        fi
+        log_warn "Oracle global install failed; trying npx fallback"
+    fi
+
+    if command -v npx &> /dev/null; then
+        log_info "Oracle available via npx"
+        return 0
     fi
 
     log_warn "Oracle not installed. APR requires Oracle for GPT Pro reviews."
