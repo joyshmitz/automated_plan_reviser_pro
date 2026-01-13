@@ -1110,7 +1110,7 @@ APR respects the [NO_COLOR](https://no-color.org/) standard. When `NO_COLOR` is 
 | Package | Purpose |
 |---------|---------|
 | Bash 4+ | Script runtime |
-| Oracle | GPT Pro browser automation |
+| [Oracle](https://github.com/steipete/oracle) | GPT Pro browser automation (excellent tool by [Peter Steinberger](https://github.com/steipete)) |
 | Node.js 18+ | Oracle runtime |
 | curl or wget | Installation |
 
@@ -1302,6 +1302,8 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-<sub>Built with Oracle, gum, and a healthy appreciation for iterative refinement.</sub>
+<sub>Built with [Oracle](https://github.com/steipete/oracle), [gum](https://github.com/charmbracelet/gum), and a healthy appreciation for iterative refinement.</sub>
+
+<sub>Special thanks to [Peter Steinberger](https://github.com/steipete) for creating Oracle, the excellent browser automation tool that makes APR possible.</sub>
 
 </div>
