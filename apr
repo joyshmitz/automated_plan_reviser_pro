@@ -803,6 +803,7 @@ confirm() {
 
 choose() {
     local prompt="$1"
+    local choice=""
     shift
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum choose --header "$prompt" "$@"
@@ -829,6 +830,7 @@ choose() {
 input() {
     local prompt="$1"
     local default="${2:-}"
+    local value=""
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         if [[ -n "$default" ]]; then
             gum input --placeholder "$default" --prompt "$prompt: " --value "$default"
@@ -848,6 +850,7 @@ input() {
 
 file_picker() {
     local prompt="$1"
+    local path=""
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         # Don't use --all to hide hidden files (.git, .apr, etc.)
         gum file --file --header "$prompt"
@@ -903,8 +906,43 @@ load_config() {
 get_config_value() {
     local key="$1"
     local config_file="$2"
-    # Handle both top-level and nested YAML keys (with optional leading whitespace)
-    grep -E "^[[:space:]]*${key}:" "$config_file" 2>/dev/null | head -1 | cut -d':' -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//'
+    # Handle both top-level and nested YAML keys while ignoring block scalar content.
+    awk -v key="$key" '
+        function indent_len(line) { match(line, /^[[:space:]]*/); return RLENGTH }
+        BEGIN { in_block = 0; block_indent = 0 }
+        {
+            if (in_block) {
+                if ($0 ~ /^[[:space:]]*$/) {
+                    next
+                }
+                if (indent_len($0) <= block_indent) {
+                    in_block = 0
+                } else {
+                    next
+                }
+            }
+            if ($0 ~ /^[[:space:]]*[^#][^:]*:[[:space:]]*[|>][-+]?[[:space:]]*$/) {
+                block_indent = indent_len($0)
+                in_block = 1
+                next
+            }
+            if ($0 ~ "^[[:space:]]*" key ":[[:space:]]*") {
+                line = $0
+                sub("^[[:space:]]*" key ":[[:space:]]*", "", line)
+                sub(/[[:space:]]*$/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$config_file"
+}
+
+# Quote a scalar value for YAML (double-quoted).
+yaml_quote() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '"%s"' "$value"
 }
 
 # Extract a YAML block scalar (| or >) for a given key.
@@ -931,6 +969,10 @@ get_yaml_block() {
                     next
                 }
                 if (indent_len == 0) {
+                    if ($0 ~ /^[[:space:]]*$/) {
+                        print ""
+                        next
+                    }
                     match($0, /^[[:space:]]+/)
                     if (RLENGTH == 0) {
                         exit
@@ -1145,19 +1187,19 @@ run_setup() {
 # Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 name: $workflow_name
-description: $description
+description: $(yaml_quote "$description")
 
 documents:
-  readme: $readme_path
-  spec: $spec_path
-  implementation: ${impl_path:-""}
+  readme: $(yaml_quote "$readme_path")
+  spec: $(yaml_quote "$spec_path")
+  implementation: $(yaml_quote "${impl_path:-}")
 
 oracle:
   model: "$model"
   thinking_time: heavy
 
 rounds:
-  output_dir: $CONFIG_DIR/rounds/$workflow_name
+  output_dir: $(yaml_quote "$CONFIG_DIR/rounds/$workflow_name")
 EOF
 
     # Create default config if this is the first workflow
@@ -2266,6 +2308,8 @@ robot_validate() {
 
     if [[ -z "$round_num" ]]; then
         errors+=("Round number required")
+    elif ! [[ "$round_num" =~ ^[0-9]+$ ]]; then
+        errors+=("Round must be a positive integer")
     fi
 
     if [[ ! -d "$CONFIG_DIR" ]]; then
@@ -2838,26 +2882,6 @@ main() {
         exit $EXIT_SUCCESS
     fi
 
-    local oracle_required=false
-    if [[ "$command" =~ ^[0-9]+$ ]]; then
-        oracle_required=true
-    else
-        case "$command" in
-            run|status|attach)
-                oracle_required=true
-                ;;
-        esac
-    fi
-
-    if [[ "$oracle_required" == "true" ]]; then
-        if ! check_oracle; then
-            print_error "Oracle not found"
-            print_info "Install with: npm install -g @steipete/oracle"
-            print_info "Or ensure npx is available"
-            exit $EXIT_DEPENDENCY_ERROR
-        fi
-    fi
-
     # Parse command and options
     shift || true
 
@@ -2988,6 +3012,39 @@ main() {
         WORKFLOW=$(get_config_value "default_workflow" "$CONFIG_DIR/config.yaml")
     fi
     WORKFLOW="${WORKFLOW:-default}"
+
+    local command_is_round=false
+    if [[ "$command" =~ ^[0-9]+$ ]]; then
+        command_is_round=true
+    fi
+
+    local oracle_required=false
+    if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
+        if [[ "$DRY_RUN" == "true" && "$RENDER" != "true" ]]; then
+            oracle_required=false
+        else
+            oracle_required=true
+        fi
+    elif [[ "$command" == "status" || "$command" == "attach" ]]; then
+        oracle_required=true
+    fi
+
+    if [[ "$oracle_required" == "true" ]]; then
+        if ! check_oracle; then
+            print_error "Oracle not found"
+            print_info "Install with: npm install -g @steipete/oracle"
+            print_info "Or ensure npx is available"
+            exit $EXIT_DEPENDENCY_ERROR
+        fi
+    else
+        # Best-effort Oracle detection for dry-run output
+        if [[ "$command_is_round" == "true" || "$command" == "run" ]]; then
+            if ! check_oracle; then
+                ORACLE_CMD="oracle"
+                [[ "$QUIET_MODE" != "true" ]] && print_warning "Oracle not found; dry run will use a placeholder command"
+            fi
+        fi
+    fi
 
     # Execute command
     case "$command" in
