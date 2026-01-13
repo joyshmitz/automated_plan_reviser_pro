@@ -142,9 +142,10 @@ verify_script() {
 
     IFS= read -r first_line < "$file" 2>/dev/null || true
 
-    if [[ "$first_line" != "#!/usr/bin/env bash" ]]; then
+    # Accept any valid bash shebang: #!/bin/bash, #!/usr/bin/env bash, etc.
+    if [[ ! "$first_line" =~ ^#!.*bash ]]; then
         log_error "Downloaded file is not a valid bash script"
-        log_error "First line: $first_line"
+        log_error "Expected bash shebang, got: $first_line"
         return 1
     fi
 
@@ -271,7 +272,15 @@ gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
                 *) log_warn "Unsupported architecture for gum: $arch"; return 1 ;;
             esac
 
-            local tmp_dir gum_version="0.14.5"
+            # Try to get latest version from GitHub API, fall back to known good version
+            local gum_version="0.14.5"  # Fallback version
+            local latest_version=""
+            latest_version=$(fetch_url "https://api.github.com/repos/charmbracelet/gum/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 | tr -d 'v') || true
+            if [[ -n "$latest_version" && "$latest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                gum_version="$latest_version"
+            fi
+
+            local tmp_dir
             tmp_dir=$(mktemp -d)
             local gum_url="https://github.com/charmbracelet/gum/releases/download/v${gum_version}/gum_${gum_version}_Linux_${arch}.tar.gz"
 
@@ -406,7 +415,7 @@ main() {
     # Checksum verification (if available and not skipped)
     if [[ -z "${APR_SKIP_VERIFY:-}" ]]; then
         local expected_checksum=""
-        expected_checksum=$(fetch_url "$checksum_url" 2>/dev/null | tr -d '[:space:]') || true
+        expected_checksum=$(fetch_url "$checksum_url" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]') || true
 
         if [[ -n "$expected_checksum" ]]; then
             log_step "Verifying checksum..."
@@ -431,11 +440,16 @@ main() {
     add_to_path "$install_dir" "$shell_config"
 
     # Install dependencies (unless disabled)
+    local gum_ok=false oracle_ok=false
     if [[ -z "${APR_NO_DEPS:-}" ]]; then
         echo "" >&2
         log_step "Installing dependencies..."
-        install_gum || true
-        install_oracle || true
+        install_gum && gum_ok=true
+        install_oracle && oracle_ok=true
+    else
+        # Check if already available
+        command -v gum &>/dev/null && gum_ok=true
+        { command -v oracle &>/dev/null || command -v npx &>/dev/null; } && oracle_ok=true
     fi
 
     # Verify installation
@@ -453,6 +467,21 @@ main() {
         echo -e "  ${GREEN}3.${NC} Capture detailed revision suggestions" >&2
         echo -e "  ${GREEN}4.${NC} Track multiple rounds of refinement" >&2
         echo "" >&2
+
+        # Show dependency status
+        echo -e "${BOLD}Dependencies:${NC}" >&2
+        if [[ "$gum_ok" == "true" ]]; then
+            echo -e "  ${GREEN}✓${NC} gum (beautiful TUI)" >&2
+        else
+            echo -e "  ${YELLOW}○${NC} gum (optional - will fall back to basic output)" >&2
+        fi
+        if [[ "$oracle_ok" == "true" ]]; then
+            echo -e "  ${GREEN}✓${NC} oracle (ChatGPT automation)" >&2
+        else
+            echo -e "  ${RED}✗${NC} oracle ${RED}(required)${NC} - install with: npm install -g @steipete/oracle" >&2
+        fi
+        echo "" >&2
+
         echo -e "${BOLD}Quick Start:${NC}" >&2
         echo "" >&2
 

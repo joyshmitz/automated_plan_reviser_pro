@@ -36,7 +36,11 @@
 #   --wait             Wait for completion (blocking)
 #   --login            Manual login mode (first-time setup)
 #   --keep-browser     Keep browser open after completion
+#   --no-preflight     Skip pre-flight checks (not recommended)
+#   --retry            Enable Oracle retries (default)
+#   --no-retry         Disable Oracle retries
 #   -q, --quiet        Minimal output (errors only)
+#   -v, --verbose      Verbose logging (debug)
 #   --version          Show version
 #
 # Environment Variables:
@@ -96,6 +100,9 @@ GUM_AVAILABLE=false
 # Quiet mode flag
 QUIET_MODE=false
 
+# Verbose mode flag (for debugging)
+VERBOSE="${APR_VERBOSE:-false}"
+
 # Configuration (XDG-compliant with overrides)
 APR_HOME="${APR_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/apr}"
 APR_CACHE="${APR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/apr}"
@@ -103,6 +110,73 @@ CONFIG_DIR=".apr"
 
 # Oracle command (determined at runtime)
 ORACLE_CMD=""
+
+# Temp directory for cleanup on exit
+APR_TEMP_DIR=""
+
+# Cleanup function for trap
+cleanup_temp() {
+    # Release any held lock
+    release_lock 2>/dev/null || true
+    # Remove temp directory
+    if [[ -n "$APR_TEMP_DIR" && -d "$APR_TEMP_DIR" ]]; then
+        rm -rf "$APR_TEMP_DIR"
+    fi
+}
+
+# Set trap for cleanup on exit/interrupt
+trap cleanup_temp EXIT INT TERM
+
+# Lock file path (set when acquired)
+APR_LOCK_FILE=""
+APR_LOCK_FD=""
+
+# Acquire a lock for a workflow/round to prevent concurrent runs
+# Usage: acquire_lock workflow round
+# Returns: 0 if acquired, 1 if already locked
+acquire_lock() {
+    local workflow="$1"
+    local round="$2"
+    local lock_dir="$CONFIG_DIR/.locks"
+    mkdir -p "$lock_dir" 2>/dev/null
+
+    APR_LOCK_FILE="$lock_dir/${workflow}_round_${round}.lock"
+
+    # Use flock if available (preferred - atomic and robust)
+    if command -v flock &>/dev/null; then
+        exec {APR_LOCK_FD}>"$APR_LOCK_FILE"
+        if ! flock -n "$APR_LOCK_FD"; then
+            return 1
+        fi
+        echo "$$" >&"$APR_LOCK_FD"
+    else
+        # Fallback: simple file-based locking
+        if [[ -f "$APR_LOCK_FILE" ]]; then
+            local pid
+            pid=$(cat "$APR_LOCK_FILE" 2>/dev/null || echo "")
+            # Check if the process is still running
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                return 1
+            fi
+            # Stale lock file - remove it
+            rm -f "$APR_LOCK_FILE"
+        fi
+        echo "$$" > "$APR_LOCK_FILE"
+    fi
+    return 0
+}
+
+# Release the lock
+release_lock() {
+    if [[ -n "$APR_LOCK_FD" ]]; then
+        exec {APR_LOCK_FD}>&-
+        APR_LOCK_FD=""
+    fi
+    if [[ -n "$APR_LOCK_FILE" && -f "$APR_LOCK_FILE" ]]; then
+        rm -f "$APR_LOCK_FILE"
+        APR_LOCK_FILE=""
+    fi
+}
 
 # -----------------------------------------------------------------------------
 # Utility Functions
@@ -147,6 +221,9 @@ check_for_updates() {
             return 0  # Skip - already checked today
         fi
     fi
+
+    # Show progress indicator if interactive
+    [[ "$QUIET_MODE" != "true" ]] && print_dim "Checking for updates..." >&2
 
     # Fetch remote version with short timeout
     local remote_version=""
@@ -213,13 +290,13 @@ cmd_update() {
         fi
     fi
 
-    # Create temp directory
-    local tmp_dir
-    tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t apr 2>/dev/null)
-    if [[ -z "$tmp_dir" || ! -d "$tmp_dir" ]]; then
+    # Create temp directory (uses global for cleanup trap)
+    APR_TEMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t apr 2>/dev/null)
+    if [[ -z "$APR_TEMP_DIR" || ! -d "$APR_TEMP_DIR" ]]; then
         print_error "Failed to create temp directory"
         exit $EXIT_UPDATE_ERROR
     fi
+    local tmp_dir="$APR_TEMP_DIR"
 
     # Download new version
     print_info "Downloading v${remote_version}..."
@@ -246,19 +323,24 @@ cmd_update() {
     # Verify it's a bash script (security check)
     local first_line=""
     IFS= read -r first_line < "$tmp_dir/apr" 2>/dev/null || true
-    if [[ "$first_line" != "#!/usr/bin/env bash" ]]; then
+    # Accept any valid bash shebang: #!/bin/bash, #!/usr/bin/env bash, etc.
+    if [[ ! "$first_line" =~ ^#!.*bash ]]; then
         print_error "Downloaded file is not a valid apr script"
+        print_dim "Expected bash shebang, got: $first_line"
         rm -rf "$tmp_dir"
         exit $EXIT_UPDATE_ERROR
     fi
 
     # Try to verify checksum (non-fatal if checksums not available)
-    local expected_checksum=""
+    # Checksum file may be: just hash, or "hash  filename" (sha256sum format)
+    local expected_checksum="" raw_checksum=""
     if command -v curl &> /dev/null; then
-        expected_checksum=$(curl -fsSL "$checksum_url" 2>/dev/null | tr -d '[:space:]') || true
+        raw_checksum=$(curl -fsSL "$checksum_url" 2>/dev/null) || true
     elif command -v wget &> /dev/null; then
-        expected_checksum=$(wget -q -O - "$checksum_url" 2>/dev/null | tr -d '[:space:]') || true
+        raw_checksum=$(wget -q -O - "$checksum_url" 2>/dev/null) || true
     fi
+    # Extract just the hash (first field if space-separated, otherwise whole string)
+    expected_checksum=$(echo "$raw_checksum" | awk '{print $1}' | tr -d '[:space:]')
 
     if [[ -n "$expected_checksum" ]]; then
         print_info "Verifying checksum..."
@@ -300,6 +382,7 @@ cmd_update() {
     fi
 
     rm -rf "$tmp_dir"
+    APR_TEMP_DIR=""  # Clear for trap
     print_success "Updated to v${remote_version}!"
 }
 
@@ -382,7 +465,8 @@ check_gum() {
     fi
 
     # Only try to install if interactive and not in CI
-    if [[ -t 1 && -z "${CI:-}" ]]; then
+    # Check stderr (-t 2) since APR outputs to stderr
+    if [[ -t 2 && -z "${CI:-}" ]]; then
         if try_install_gum; then
             if [[ -x "${HOME}/.local/bin/gum" && ":$PATH:" != *":${HOME}/.local/bin:"* ]]; then
                 export PATH="${HOME}/.local/bin:${PATH}"
@@ -414,6 +498,146 @@ check_oracle() {
 }
 
 # -----------------------------------------------------------------------------
+# Pre-flight Oracle Validation
+# -----------------------------------------------------------------------------
+
+# Run pre-flight checks before expensive Oracle runs
+# Usage: preflight_check readme_path spec_path [impl_path]
+# Returns: 0 if all checks pass, 1 if critical failure, 2 if warning only
+preflight_check() {
+    local readme_path="$1"
+    local spec_path="$2"
+    local impl_path="${3:-}"
+    local has_warnings=false
+
+    verbose "preflight_check: readme=$readme_path spec=$spec_path impl=${impl_path:-<none>}"
+
+    print_info "Running pre-flight checks..."
+
+    # Check Oracle availability
+    if ! check_oracle; then
+        print_error "Pre-flight failed: Oracle not available"
+        return 1
+    fi
+    verbose "preflight: Oracle available via $ORACLE_CMD"
+
+    # Try to check Oracle health (quick version check)
+    local oracle_version=""
+    if oracle_version=$($ORACLE_CMD --version 2>/dev/null); then
+        verbose "preflight: Oracle version: $oracle_version"
+        print_success "Oracle available ($oracle_version)"
+    else
+        print_warning "Could not verify Oracle version (may still work)"
+        has_warnings=true
+    fi
+
+    # Check source files exist and are readable
+    if [[ ! -f "$readme_path" ]]; then
+        print_error "Pre-flight failed: README not found: $readme_path"
+        return 1
+    fi
+    if [[ ! -r "$readme_path" ]]; then
+        print_error "Pre-flight failed: README not readable: $readme_path"
+        return 1
+    fi
+    local readme_size
+    readme_size=$(du -h "$readme_path" 2>/dev/null | cut -f1)
+    verbose "preflight: README exists: $readme_path ($readme_size)"
+    print_success "README: $readme_path ($readme_size)"
+
+    if [[ ! -f "$spec_path" ]]; then
+        print_error "Pre-flight failed: Spec not found: $spec_path"
+        return 1
+    fi
+    if [[ ! -r "$spec_path" ]]; then
+        print_error "Pre-flight failed: Spec not readable: $spec_path"
+        return 1
+    fi
+    local spec_size
+    spec_size=$(du -h "$spec_path" 2>/dev/null | cut -f1)
+    verbose "preflight: Spec exists: $spec_path ($spec_size)"
+    print_success "Spec: $spec_path ($spec_size)"
+
+    # Check implementation file if provided
+    if [[ -n "$impl_path" ]]; then
+        if [[ ! -f "$impl_path" ]]; then
+            print_warning "Implementation not found: $impl_path (will be skipped)"
+            has_warnings=true
+        elif [[ ! -r "$impl_path" ]]; then
+            print_warning "Implementation not readable: $impl_path (will be skipped)"
+            has_warnings=true
+        else
+            local impl_size
+            impl_size=$(du -h "$impl_path" 2>/dev/null | cut -f1)
+            verbose "preflight: Implementation exists: $impl_path ($impl_size)"
+            print_success "Implementation: $impl_path ($impl_size)"
+        fi
+    fi
+
+    echo "" >&2
+    if [[ "$has_warnings" == "true" ]]; then
+        print_warning "Pre-flight completed with warnings"
+        return 2
+    else
+        print_success "All pre-flight checks passed"
+        return 0
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Auto-Retry with Exponential Backoff
+# -----------------------------------------------------------------------------
+
+# Maximum retry attempts
+MAX_RETRY_ATTEMPTS="${APR_MAX_RETRIES:-3}"
+# Initial backoff in seconds
+INITIAL_BACKOFF="${APR_INITIAL_BACKOFF:-10}"
+
+# Run Oracle with auto-retry on transient failures
+# Usage: run_oracle_with_retry oracle_args...
+# Returns: Oracle exit code
+run_oracle_with_retry() {
+    local attempt=1
+    local backoff="$INITIAL_BACKOFF"
+    local exit_code=0
+
+    verbose "run_oracle_with_retry: max_attempts=$MAX_RETRY_ATTEMPTS initial_backoff=$INITIAL_BACKOFF"
+
+    while [[ $attempt -le $MAX_RETRY_ATTEMPTS ]]; do
+        verbose "Oracle attempt $attempt/$MAX_RETRY_ATTEMPTS"
+
+        # Run Oracle command
+        set +e
+        $ORACLE_CMD "$@"
+        exit_code=$?
+        set -e
+
+        verbose "Oracle attempt $attempt exit_code=$exit_code"
+
+        # Success - return immediately
+        if [[ $exit_code -eq 0 ]]; then
+            return 0
+        fi
+
+        # Check if this is a retryable error
+        # Exit codes: typically network/transient issues are specific codes
+        # For now, we'll retry on any non-zero exit if we have attempts left
+        if [[ $attempt -lt $MAX_RETRY_ATTEMPTS ]]; then
+            print_warning "Attempt $attempt/$MAX_RETRY_ATTEMPTS failed (exit code: $exit_code)"
+            print_info "Retrying in ${backoff}s..."
+            sleep "$backoff"
+            # Exponential backoff: 10s, 30s, 90s
+            backoff=$((backoff * 3))
+        fi
+
+        ((attempt++))
+    done
+
+    print_error "All $MAX_RETRY_ATTEMPTS attempts failed"
+    return "$exit_code"
+}
+
+# -----------------------------------------------------------------------------
 # Styled Output Functions
 # -----------------------------------------------------------------------------
 
@@ -431,11 +655,25 @@ print_banner() {
             "  Automated Plan Reviser Pro v${VERSION}" \
             "  Iterative AI-Powered Spec Refinement" >&2
     else
+        # Get terminal width, default to 60 if unavailable
+        local term_width
+        term_width=$(tput cols 2>/dev/null || echo "60")
+        # Cap at 60 for aesthetics
+        (( term_width > 60 )) && term_width=60
+        # Minimum width for readability
+        (( term_width < 40 )) && term_width=40
+
+        # Generate border of appropriate width
+        local border=""
+        for ((i=0; i<term_width; i++)); do
+            border+="━"
+        done
+
         echo "" >&2
-        echo -e "${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}${border}${NC}" >&2
         echo -e "  ${BOLD}${WHITE}Automated Plan Reviser Pro${NC} ${DIM}v${VERSION}${NC}" >&2
         echo -e "  ${DIM}Iterative AI-Powered Spec Refinement${NC}" >&2
-        echo -e "${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}${border}${NC}" >&2
         echo "" >&2
     fi
 }
@@ -498,15 +736,28 @@ print_dim() {
     fi
 }
 
+# Verbose logging (only shown when VERBOSE=true or --verbose flag)
+verbose() {
+    [[ "$VERBOSE" != "true" ]] && return
+    echo -e "${DIM}[apr:verbose]${NC} $*" >&2
+}
+
 print_step() {
     [[ "$QUIET_MODE" == "true" ]] && return
     local step="$1"
     local total="$2"
     local text="$3"
+    local optional="${4:-}"  # Pass "optional" for optional steps
+
+    local step_label="[$step/$total]"
+    if [[ "$optional" == "optional" ]]; then
+        step_label="[Optional]"
+    fi
+
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
-        echo "$(gum style --foreground 212 --bold "[$step/$total]") $(gum style --faint "$text")" >&2
+        echo "$(gum style --foreground 212 --bold "$step_label") $(gum style --faint "$text")" >&2
     else
-        echo -e "${BOLD}${MAGENTA}[$step/$total]${NC} ${DIM}$text${NC}" >&2
+        echo -e "${BOLD}${MAGENTA}${step_label}${NC} ${DIM}$text${NC}" >&2
     fi
 }
 
@@ -598,7 +849,8 @@ input() {
 file_picker() {
     local prompt="$1"
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
-        gum file --all --file --header "$prompt"
+        # Don't use --all to hide hidden files (.git, .apr, etc.)
+        gum file --file --header "$prompt"
     else
         read -rp "$prompt (enter path): " path
         echo "$path"
@@ -608,6 +860,24 @@ file_picker() {
 # -----------------------------------------------------------------------------
 # Configuration Management
 # -----------------------------------------------------------------------------
+
+# Show first-run welcome message for users who haven't set up yet
+show_first_run_welcome() {
+    print_banner
+    echo "" >&2
+    print_header "WELCOME TO APR!"
+    echo "" >&2
+    echo "  APR automates iterative specification refinement using" >&2
+    echo "  GPT Pro Extended Reasoning via Oracle." >&2
+    echo "" >&2
+    print_info "To get started, run the setup wizard:"
+    echo "" >&2
+    echo -e "    ${CYAN}apr setup${NC}" >&2
+    echo "" >&2
+    print_dim "This will configure your workflow and document paths."
+    print_dim "For full documentation, run 'apr help'."
+    echo "" >&2
+}
 
 ensure_config_dir() {
     mkdir -p "$CONFIG_DIR"
@@ -637,11 +907,82 @@ get_config_value() {
     grep -E "^[[:space:]]*${key}:" "$config_file" 2>/dev/null | head -1 | cut -d':' -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//'
 }
 
+# Extract a YAML block scalar (| or >) for a given key.
+# Returns block contents via stdout, or empty if not found.
+get_yaml_block() {
+    local key="$1"
+    local config_file="$2"
+
+    awk -v key="$key" '
+        BEGIN {
+            found = 0
+            indent_len = 0
+            indent = ""
+        }
+        {
+            if (!found) {
+                if ($0 ~ "^[[:space:]]*" key ":[[:space:]]*[|>][-+]?[[:space:]]*$") {
+                    found = 1
+                    next
+                }
+            } else {
+                if ($0 ~ /^[[:space:]]*$/) {
+                    print ""
+                    next
+                }
+                if (indent_len == 0) {
+                    match($0, /^[[:space:]]+/)
+                    if (RLENGTH == 0) {
+                        exit
+                    }
+                    indent_len = RLENGTH
+                    indent = substr($0, 1, indent_len)
+                }
+                match($0, /^[[:space:]]+/)
+                if (RLENGTH < indent_len) {
+                    exit
+                }
+                line = $0
+                sub("^" indent, "", line)
+                print line
+            }
+        }
+    ' "$config_file"
+}
+
+load_prompt_template() {
+    local include_impl="$1"
+    local config_file="$2"
+    local template=""
+
+    if [[ -z "$config_file" || ! -f "$config_file" ]]; then
+        return 0
+    fi
+
+    if [[ "$include_impl" == "true" ]]; then
+        template=$(get_yaml_block "template_with_impl" "$config_file")
+    fi
+
+    if [[ -z "$template" ]]; then
+        template=$(get_yaml_block "template" "$config_file")
+    fi
+
+    printf '%s' "$template"
+}
+
 # Build the revision prompt for GPT Pro review
 # Usage: build_revision_prompt [include_impl]
 # Returns prompt via stdout
 build_revision_prompt() {
     local include_impl="${1:-false}"
+    local config_file="${2:-}"
+    local template=""
+
+    template=$(load_prompt_template "$include_impl" "$config_file")
+    if [[ -n "$template" ]]; then
+        printf '%s\n' "$template"
+        return 0
+    fi
 
     local prompt="First, read this README:
 
@@ -681,7 +1022,7 @@ with the git-diff style change versus the original plan shown below:
 \`\`\`
 "
 
-    echo "$prompt"
+    printf '%s\n' "$prompt"
 }
 
 # -----------------------------------------------------------------------------
@@ -713,7 +1054,7 @@ run_setup() {
     ensure_config_dir
 
     # Step 1: Workflow name
-    print_step 1 6 "Workflow name"
+    print_step 1 5 "Workflow name"
     local workflow_name
     while true; do
         workflow_name=$(input "Workflow name" "default")
@@ -734,13 +1075,13 @@ run_setup() {
     echo "" >&2
 
     # Step 2: Project description
-    print_step 2 6 "Project description"
+    print_step 2 5 "Project description"
     local description
     description=$(input "Brief description" "Iterative specification refinement")
     echo "" >&2
 
     # Step 3: README/Overview document
-    print_step 3 6 "README/Overview document"
+    print_step 3 5 "README/Overview document"
     print_info "Select the main README or overview document"
     local readme_path
     readme_path=$(file_picker "Select README file")
@@ -752,7 +1093,7 @@ run_setup() {
     echo "" >&2
 
     # Step 4: Specification document
-    print_step 4 6 "Specification document"
+    print_step 4 5 "Specification document"
     print_info "Select the main specification/plan document"
     local spec_path
     spec_path=$(file_picker "Select specification file")
@@ -764,7 +1105,7 @@ run_setup() {
     echo "" >&2
 
     # Step 5: Implementation document (optional)
-    print_step 5 6 "Implementation document (optional)"
+    print_step 0 0 "Implementation document" "optional"
     local impl_path=""
     if confirm "Do you have an implementation/reference document?"; then
         impl_path=$(file_picker "Select implementation file")
@@ -777,8 +1118,8 @@ run_setup() {
     fi
     echo "" >&2
 
-    # Step 6: Review preferences
-    print_step 6 6 "Review preferences"
+    # Step 5: Review preferences
+    print_step 5 5 "Review preferences"
     local model
     model=$(choose "Select GPT model for reviews:" \
         "5.2 Thinking (Extended Reasoning)" \
@@ -801,7 +1142,7 @@ run_setup() {
     # Write config file
     cat > "$workflow_dir/$workflow_name.yaml" << EOF
 # APR Workflow Configuration
-# Generated: $(date -Iseconds)
+# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 name: $workflow_name
 description: $description
@@ -866,14 +1207,28 @@ run_round() {
     local wait_mode="${WAIT_MODE:-false}"
     local manual_login="${MANUAL_LOGIN:-false}"
     local keep_browser="${KEEP_BROWSER:-false}"
+    local skip_preflight="${SKIP_PREFLIGHT:-false}"
+    local enable_retry="${ENABLE_RETRY:-true}"
 
     print_banner
 
+    verbose "Starting run_round: round=$round_num workflow=$workflow"
+    verbose "Options: include_impl=$include_impl dry_run=$dry_run render=$render"
+    verbose "Options: wait_mode=$wait_mode manual_login=$manual_login"
+    verbose "Options: skip_preflight=$skip_preflight enable_retry=$enable_retry"
+
     # Load workflow config
     local config_path="$CONFIG_DIR/workflows/$workflow.yaml"
+    verbose "Loading workflow config: $config_path"
     if [[ ! -f "$config_path" ]]; then
-        print_error "Workflow '$workflow' not found"
-        print_info "Run 'apr setup' to create a new workflow"
+        # If no config at all, show the friendly welcome experience
+        if [[ ! -d "$CONFIG_DIR" || ! -f "$CONFIG_DIR/config.yaml" ]]; then
+            show_first_run_welcome
+        else
+            print_error "Workflow '$workflow' not found"
+            print_info "Run 'apr setup' to create a new workflow"
+            print_info "Or 'apr list' to see available workflows"
+        fi
         exit $EXIT_CONFIG_ERROR
     fi
 
@@ -885,17 +1240,46 @@ run_round() {
     model=$(get_config_value "model" "$config_path" | tr -d '"')
     output_dir=$(get_config_value "output_dir" "$config_path" | tr -d '"')
 
-    # Validate files exist
-    for f in "$readme_path" "$spec_path"; do
-        if [[ ! -f "$f" ]]; then
-            print_error "Required file not found: $f"
+    verbose "Config parsed:"
+    verbose "  README: $readme_path"
+    verbose "  Spec: $spec_path"
+    verbose "  Implementation: ${impl_path:-<not configured>}"
+    verbose "  Model: $model"
+    verbose "  Output dir: $output_dir"
+
+    # Run pre-flight checks (unless skipped or dry-run/render mode)
+    if [[ "$skip_preflight" != "true" && "$dry_run" != "true" && "$render" != "true" ]]; then
+        local impl_for_preflight=""
+        [[ "$include_impl" == "true" && -n "$impl_path" ]] && impl_for_preflight="$impl_path"
+
+        local preflight_result=0
+        preflight_check "$readme_path" "$spec_path" "$impl_for_preflight" || preflight_result=$?
+
+        if [[ $preflight_result -eq 1 ]]; then
+            print_error "Pre-flight checks failed. Fix the issues above and try again."
+            print_info "Use --no-preflight to skip these checks (not recommended)"
             exit $EXIT_CONFIG_ERROR
         fi
-    done
+        # preflight_result=2 means warnings only, continue execution
+    else
+        verbose "Skipping pre-flight checks (skip_preflight=$skip_preflight dry_run=$dry_run render=$render)"
+        # Basic file validation when preflight is skipped
+        for f in "$readme_path" "$spec_path"; do
+            if [[ ! -f "$f" ]]; then
+                print_error "Required file not found: $f"
+                exit $EXIT_CONFIG_ERROR
+            fi
+        done
+    fi
 
-    if [[ "$include_impl" == "true" && -n "$impl_path" && ! -f "$impl_path" ]]; then
-        print_warning "Implementation file not found: $impl_path"
-        include_impl=false
+    if [[ "$include_impl" == "true" ]]; then
+        if [[ -z "$impl_path" ]]; then
+            print_warning "Implementation document not configured; skipping"
+            include_impl=false
+        elif [[ ! -f "$impl_path" ]]; then
+            print_warning "Implementation file not found: $impl_path"
+            include_impl=false
+        fi
     fi
 
     # Display round info
@@ -951,7 +1335,12 @@ run_round() {
 
     # Build prompt using shared function
     local prompt
-    prompt=$(build_revision_prompt "$include_impl")
+    prompt=$(build_revision_prompt "$include_impl" "$config_path")
+    if [[ -z "$prompt" ]]; then
+        print_error "Prompt template is empty"
+        print_info "Add 'template' or 'template_with_impl' to $config_path"
+        exit $EXIT_CONFIG_ERROR
+    fi
 
     # Dry run mode
     if [[ "$dry_run" == "true" ]]; then
@@ -983,6 +1372,16 @@ run_round() {
         exit $EXIT_SUCCESS
     fi
 
+    # Acquire lock to prevent concurrent runs of the same workflow/round (foreground only)
+    # In background mode, we rely on the output file overwrite warning
+    if [[ "$wait_mode" == "true" ]]; then
+        if ! acquire_lock "$workflow" "$round_num"; then
+            print_error "Another APR process is already running round $round_num for workflow '$workflow'"
+            print_info "Wait for it to complete or check 'apr status'"
+            exit $EXIT_CONFIG_ERROR
+        fi
+    fi
+
     # Build Oracle command
     local oracle_args=(
         --engine browser
@@ -998,6 +1397,10 @@ run_round() {
     [[ "$manual_login" == "true" ]] && oracle_args+=(--browser-manual-login)
     [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
     oracle_args+=(-p "$prompt")
+
+    verbose "Oracle command: $ORACLE_CMD ${oracle_args[*]}"
+    verbose "Output file: $output_file"
+    verbose "Session slug: $slug"
 
     # Create output directory
     mkdir -p "$(dirname "$output_file")"
@@ -1016,14 +1419,50 @@ run_round() {
 
     if [[ "$wait_mode" == "true" ]]; then
         print_info "Running in foreground (--wait)..."
+        [[ "$enable_retry" == "true" ]] && print_dim "Auto-retry enabled (up to $MAX_RETRY_ATTEMPTS attempts)"
+        print_dim "Elapsed time will be shown on completion."
         echo "" >&2
-        $ORACLE_CMD "${oracle_args[@]}"
+        local start_time oracle_exit=0
+        start_time=$(date +%s)
+
+        # Use auto-retry wrapper if enabled
+        if [[ "$enable_retry" == "true" ]]; then
+            run_oracle_with_retry "${oracle_args[@]}" || oracle_exit=$?
+        else
+            $ORACLE_CMD "${oracle_args[@]}" || oracle_exit=$?
+        fi
+
+        local end_time elapsed_secs elapsed_fmt
+        end_time=$(date +%s)
+        elapsed_secs=$((end_time - start_time))
+        # Format elapsed time as HH:MM:SS or MM:SS
+        if (( elapsed_secs >= 3600 )); then
+            elapsed_fmt=$(printf '%d:%02d:%02d' $((elapsed_secs/3600)) $((elapsed_secs%3600/60)) $((elapsed_secs%60)))
+        else
+            elapsed_fmt=$(printf '%d:%02d' $((elapsed_secs/60)) $((elapsed_secs%60)))
+        fi
         echo "" >&2
-        print_success "Review complete!"
-        print_info "Output saved to: $output_file"
+
+        if [[ $oracle_exit -eq 0 ]]; then
+            print_success "Review complete! (${elapsed_fmt} elapsed)"
+            print_info "Output saved to: $output_file"
+        else
+            print_error "Oracle failed after ${elapsed_fmt} (exit code: $oracle_exit)"
+            exit $oracle_exit
+        fi
     else
         $ORACLE_CMD "${oracle_args[@]}" &
         local oracle_pid=$!
+
+        # Brief delay to verify process started
+        sleep 0.5
+
+        # Verify the process is actually running
+        if ! kill -0 "$oracle_pid" 2>/dev/null; then
+            print_error "Oracle process failed to start"
+            print_info "Try running with --wait to see error output"
+            exit $EXIT_DEPENDENCY_ERROR
+        fi
 
         print_success "Oracle running in background (PID: $oracle_pid)"
         echo "" >&2
@@ -1052,11 +1491,36 @@ run_round() {
 
     echo "" >&2
     print_header "NEXT STEPS AFTER REVIEW COMPLETES"
-    echo "1. Review the output in $output_file" >&2
-    echo "2. Integrate feedback into your specification" >&2
-    echo "3. Update README to reflect changes" >&2
-    echo "4. Harmonize implementation doc (if applicable)" >&2
-    echo "5. Commit and push" >&2
+
+    # Contextual tips based on round number and options
+    local tips=()
+    tips+=("Review the output in $output_file")
+    tips+=("Integrate feedback into your specification")
+    tips+=("Update README to reflect changes")
+
+    if [[ -n "$impl_path" ]]; then
+        tips+=("Harmonize implementation doc")
+    fi
+
+    tips+=("Commit changes and repeat")
+
+    # Show numbered steps
+    local step=1
+    for tip in "${tips[@]}"; do
+        echo "$step. $tip" >&2
+        ((step++))
+    done
+
+    echo "" >&2
+
+    # Contextual suggestions
+    if [[ "$round_num" == "1" && "$manual_login" != "true" ]]; then
+        print_dim "Tip: For first runs, use --login to handle browser authentication"
+    elif [[ "$round_num" -ge 3 && "$include_impl" != "true" && -n "$impl_path" ]]; then
+        print_dim "Tip: Try using --include-impl to get implementation-aware feedback"
+    elif [[ "$round_num" -ge 5 ]]; then
+        print_dim "Tip: After 5+ rounds, look for convergence - similar feedback suggests stability"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1159,9 +1623,28 @@ show_history() {
         exit $EXIT_SUCCESS
     fi
 
+    # Collect all round files and find the latest
+    local round_files=()
+    local latest_round=0
     for round_file in "$rounds_dir"/round_*.md; do
         [[ -f "$round_file" ]] || continue
-        local round_num size mod_date
+        round_files+=("$round_file")
+        local num
+        num=$(basename "$round_file" .md | sed 's/round_//')
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num > latest_round )); then
+            latest_round=$num
+        fi
+    done
+
+    if [[ ${#round_files[@]} -eq 0 ]]; then
+        print_warning "No rounds recorded yet for workflow '$workflow'"
+        print_info "Run 'apr run 1' to start your first revision round"
+        exit $EXIT_SUCCESS
+    fi
+
+    # Display each round with enhanced info
+    for round_file in "${round_files[@]}"; do
+        local round_num size mod_date first_line is_latest=""
         round_num=$(basename "$round_file" .md | sed 's/round_//')
         size=$(du -h "$round_file" 2>/dev/null | cut -f1)
         # Cross-platform date: try GNU stat, then BSD stat, then ls fallback
@@ -1169,8 +1652,27 @@ show_history() {
                    stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$round_file" 2>/dev/null || \
                    ls -l "$round_file" 2>/dev/null | awk '{print $6, $7, $8}')
 
-        echo -e "  ${CYAN}Round $round_num${NC}  ${DIM}$size${NC}  ${DIM}$mod_date${NC}" >&2
+        # Get first non-empty line as preview
+        first_line=$(grep -m1 '.' "$round_file" 2>/dev/null | head -c 60 | tr '\n' ' ')
+        [[ ${#first_line} -eq 60 ]] && first_line="${first_line}..."
+
+        # Mark latest round
+        if [[ "$round_num" == "$latest_round" ]]; then
+            is_latest=" ${GREEN}(latest)${NC}"
+        fi
+
+        if [[ "$GUM_AVAILABLE" == "true" ]]; then
+            echo "$(gum style --foreground 82 --bold "Round $round_num")${is_latest}  $(gum style --faint "$size  $mod_date")" >&2
+            [[ -n "$first_line" ]] && gum style --faint "    $first_line" >&2
+        else
+            echo -e "  ${CYAN}${BOLD}Round $round_num${NC}${is_latest}  ${DIM}$size  $mod_date${NC}" >&2
+            [[ -n "$first_line" ]] && echo -e "    ${DIM}$first_line${NC}" >&2
+        fi
+        echo "" >&2
     done
+
+    # Summary
+    print_dim "Total: ${#round_files[@]} round(s). Use 'apr show <round>' to view content."
 }
 
 # -----------------------------------------------------------------------------
@@ -1208,6 +1710,324 @@ show_round() {
         fi
     else
         cat "$output_file"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Diff Rounds - Compare two round outputs
+# -----------------------------------------------------------------------------
+
+diff_rounds() {
+    local round_a="$1"
+    local round_b="${2:-}"
+    local workflow="${WORKFLOW:-default}"
+
+    verbose "diff_rounds: round_a=$round_a round_b=${round_b:-<auto>} workflow=$workflow"
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        print_error "Workflow '$workflow' not found"
+        print_info "Run 'apr list' to see available workflows"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    local rounds_dir="$CONFIG_DIR/rounds/$workflow"
+
+    # If only one round given, compare with previous
+    if [[ -z "$round_b" ]]; then
+        if [[ "$round_a" -le 1 ]]; then
+            print_error "Round 1 has no previous round to compare with"
+            print_info "Usage: apr diff <round_a> <round_b>"
+            exit $EXIT_USAGE_ERROR
+        fi
+        round_b=$((round_a - 1))
+        verbose "Auto-selected round_b=$round_b (previous round)"
+    fi
+
+    local file_a="$rounds_dir/round_${round_a}.md"
+    local file_b="$rounds_dir/round_${round_b}.md"
+
+    # Validate both files exist
+    if [[ ! -f "$file_a" ]]; then
+        print_error "Round $round_a not found for workflow '$workflow'"
+        print_info "Run 'apr history' to see available rounds"
+        exit $EXIT_CONFIG_ERROR
+    fi
+    if [[ ! -f "$file_b" ]]; then
+        print_error "Round $round_b not found for workflow '$workflow'"
+        print_info "Run 'apr history' to see available rounds"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    local size_a size_b
+    size_a=$(du -h "$file_a" 2>/dev/null | cut -f1)
+    size_b=$(du -h "$file_b" 2>/dev/null | cut -f1)
+
+    print_banner
+    print_header "ROUND COMPARISON: $round_b → $round_a"
+    echo "" >&2
+    print_info "Comparing Round $round_b ($size_b) with Round $round_a ($size_a)"
+    echo "" >&2
+
+    # Use delta if available (beautiful diff), otherwise fall back to diff
+    # Note: diff returns 1 when files differ (expected), so we use || true to prevent
+    # script exit with set -euo pipefail. Exit code 2 indicates an actual error.
+    if command -v delta &>/dev/null; then
+        verbose "Using delta for diff"
+        delta --side-by-side "$file_b" "$file_a" || true
+    elif command -v diff &>/dev/null; then
+        verbose "Using diff (delta not available)"
+        # Use colored diff if terminal supports it
+        if [[ -t 1 ]] && diff --color=auto /dev/null /dev/null 2>/dev/null; then
+            if command -v less &>/dev/null; then
+                diff --color=auto -u "$file_b" "$file_a" | less -R || true
+            else
+                diff --color=auto -u "$file_b" "$file_a" || true
+            fi
+        else
+            if [[ -t 1 ]] && command -v less &>/dev/null; then
+                diff -u "$file_b" "$file_a" | less || true
+            else
+                diff -u "$file_b" "$file_a" || true
+            fi
+        fi
+    else
+        print_error "No diff tool available (install delta for best experience)"
+        exit $EXIT_DEPENDENCY_ERROR
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Integrate - Generate Claude Code integration prompt
+# -----------------------------------------------------------------------------
+
+generate_integration() {
+    local round_num="$1"
+    local workflow="${WORKFLOW:-default}"
+    local output_path="${INTEGRATE_OUTPUT:-}"
+    local copy_to_clipboard="${COPY:-false}"
+
+    verbose "generate_integration: round=$round_num workflow=$workflow output=${output_path:-<stdout>} copy=$copy_to_clipboard"
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        print_error "Workflow '$workflow' not found"
+        print_info "Run 'apr list' to see available workflows"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    # Get workflow config
+    local spec_path
+    spec_path=$(get_config_value "spec" "$workflow_file" | tr -d '"')
+
+    local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
+    if [[ ! -f "$round_file" ]]; then
+        print_error "Round $round_num not found for workflow '$workflow'"
+        print_info "Run 'apr history' to see available rounds"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    local round_size
+    round_size=$(du -h "$round_file" 2>/dev/null | cut -f1)
+
+    # Build the integration prompt
+    local prompt
+    prompt=$(cat <<EOF
+First read ALL of the AGENTS.md file and README.md file super carefully
+and understand ALL of both! Then use your code investigation agent mode
+to fully understand the code and technical architecture of the project.
+Read ALL of the specification document at: $spec_path
+
+Now integrate the following feedback from GPT Pro 5.2 Extended Reasoning
+(Round $round_num of the APR iterative refinement process). For each
+suggestion, carefully evaluate whether you agree with the proposed change.
+Then apply the changes you endorse to the specification document.
+
+Be meticulous and use ultrathink.
+
+---
+
+$(cat "$round_file")
+EOF
+)
+
+    # Output handling
+    if [[ -n "$output_path" ]]; then
+        # Write to file
+        echo "$prompt" > "$output_path"
+        print_success "Integration prompt saved to: $output_path"
+    elif [[ "$copy_to_clipboard" == "true" ]]; then
+        # Copy to clipboard
+        if command -v pbcopy &>/dev/null; then
+            echo "$prompt" | pbcopy
+            print_success "Integration prompt copied to clipboard (pbcopy)"
+        elif command -v xclip &>/dev/null; then
+            echo "$prompt" | xclip -selection clipboard
+            print_success "Integration prompt copied to clipboard (xclip)"
+        elif command -v xsel &>/dev/null; then
+            echo "$prompt" | xsel --clipboard
+            print_success "Integration prompt copied to clipboard (xsel)"
+        else
+            print_warning "No clipboard tool found (pbcopy, xclip, xsel)"
+            print_info "Outputting to stdout instead:"
+            echo ""
+            echo "$prompt"
+        fi
+    else
+        # Output to stdout
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            print_banner
+            print_header "CLAUDE CODE INTEGRATION PROMPT"
+            print_info "Round $round_num ($round_size) for workflow '$workflow'"
+            echo "" >&2
+            print_dim "Copy the following prompt to Claude Code:"
+            echo "" >&2
+            echo "─────────────────────────────────────────────────────────────" >&2
+        fi
+        echo "$prompt"
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            echo "" >&2
+            echo "─────────────────────────────────────────────────────────────" >&2
+            echo "" >&2
+            print_dim "Tip: Use 'apr integrate $round_num --copy' to copy to clipboard"
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Stats - Round analytics and convergence signals
+# -----------------------------------------------------------------------------
+
+show_stats() {
+    local workflow="${WORKFLOW:-default}"
+
+    verbose "show_stats: workflow=$workflow"
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        print_error "Workflow '$workflow' not found"
+        print_info "Run 'apr list' to see available workflows"
+        exit $EXIT_CONFIG_ERROR
+    fi
+
+    local rounds_dir="$CONFIG_DIR/rounds/$workflow"
+    if [[ ! -d "$rounds_dir" ]]; then
+        print_warning "No rounds recorded yet for workflow '$workflow'"
+        print_info "Run 'apr run 1' to start your first revision round"
+        exit $EXIT_SUCCESS
+    fi
+
+    # Collect round data
+    local total_rounds=0
+    local total_size=0
+    local round_data=()
+    local sizes=()
+
+    for round_file in "$rounds_dir"/round_*.md; do
+        [[ -f "$round_file" ]] || continue
+        ((total_rounds++))
+
+        local round_num size_bytes size_human mod_ts
+        round_num=$(basename "$round_file" .md | sed 's/round_//')
+        size_bytes=$(stat -c '%s' "$round_file" 2>/dev/null || stat -f '%z' "$round_file" 2>/dev/null || echo "0")
+        size_human=$(du -h "$round_file" 2>/dev/null | cut -f1)
+        mod_ts=$(stat -c '%Y' "$round_file" 2>/dev/null || stat -f '%m' "$round_file" 2>/dev/null || echo "0")
+
+        total_size=$((total_size + size_bytes))
+        sizes+=("$size_bytes")
+        round_data+=("$round_num|$size_human|$size_bytes|$mod_ts")
+    done
+
+    if [[ $total_rounds -eq 0 ]]; then
+        print_warning "No rounds recorded yet for workflow '$workflow'"
+        print_info "Run 'apr run 1' to start your first revision round"
+        exit $EXIT_SUCCESS
+    fi
+
+    # Calculate statistics
+    local avg_size=$((total_size / total_rounds))
+    local avg_human
+    if [[ $avg_size -ge 1048576 ]]; then
+        avg_human="$(echo "scale=1; $avg_size / 1048576" | bc 2>/dev/null || echo "$((avg_size / 1048576))M")"
+        [[ "$avg_human" != *M ]] && avg_human="${avg_human}M"
+    elif [[ $avg_size -ge 1024 ]]; then
+        avg_human="$(echo "scale=1; $avg_size / 1024" | bc 2>/dev/null || echo "$((avg_size / 1024))K")"
+        [[ "$avg_human" != *K ]] && avg_human="${avg_human}K"
+    else
+        avg_human="${avg_size}B"
+    fi
+
+    # Detect trend (compare first half vs second half)
+    local trend_signal=""
+    if [[ $total_rounds -ge 4 ]]; then
+        local half=$((total_rounds / 2))
+        local first_half_avg=0 second_half_avg=0
+        local i=0
+        for size in "${sizes[@]}"; do
+            if [[ $i -lt $half ]]; then
+                first_half_avg=$((first_half_avg + size))
+            else
+                second_half_avg=$((second_half_avg + size))
+            fi
+            ((i++))
+        done
+        first_half_avg=$((first_half_avg / half))
+        second_half_avg=$((second_half_avg / (total_rounds - half)))
+
+        if [[ $second_half_avg -lt $((first_half_avg * 80 / 100)) ]]; then
+            trend_signal="Output size trending down (convergence signal)"
+        elif [[ $second_half_avg -gt $((first_half_avg * 120 / 100)) ]]; then
+            trend_signal="Output size trending up (scope may be expanding)"
+        else
+            trend_signal="Output size stable"
+        fi
+    fi
+
+    # Display stats
+    print_banner
+    print_header "REVISION STATISTICS: $workflow"
+    echo "" >&2
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded \
+            --border-foreground 212 \
+            --padding "1 2" \
+            "$(gum style --foreground 39 "Rounds completed:")    $total_rounds" \
+            "$(gum style --foreground 39 "Average output size:") $avg_human" >&2
+    else
+        echo -e "  ${CYAN}Rounds completed:${NC}    $total_rounds" >&2
+        echo -e "  ${CYAN}Average output size:${NC} $avg_human" >&2
+    fi
+
+    echo "" >&2
+    echo -e "  ${BOLD}${YELLOW}Round    Size    Modified${NC}" >&2
+    echo -e "  ${DIM}─────    ────    ────────${NC}" >&2
+
+    # Display round table
+    for data in "${round_data[@]}"; do
+        IFS='|' read -r round_num size_human size_bytes mod_ts <<< "$data"
+        local mod_date
+        mod_date=$(date -d "@$mod_ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$mod_ts" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "N/A")
+        printf "  %-8s %-7s %s\n" "$round_num" "$size_human" "$mod_date" >&2
+    done
+
+    echo "" >&2
+
+    # Show trend signal if available
+    if [[ -n "$trend_signal" ]]; then
+        print_info "$trend_signal"
+        echo "" >&2
+    fi
+
+    # Suggestions based on round count
+    if [[ $total_rounds -ge 5 ]]; then
+        print_dim "Tip: After 5+ rounds, look for convergence - similar feedback suggests stability"
+    elif [[ $total_rounds -eq 1 ]]; then
+        print_dim "Tip: Run more rounds to see convergence trends"
     fi
 }
 
@@ -1456,6 +2276,8 @@ robot_run() {
     local round_num="${1:-}"
     local include_impl="${INCLUDE_IMPL:-false}"
 
+    verbose "robot_run: round=$round_num workflow=$WORKFLOW include_impl=$include_impl"
+
     # First validate
     if [[ -z "$round_num" ]]; then
         robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
@@ -1498,6 +2320,12 @@ robot_run() {
         return 1
     fi
 
+    if [[ "$include_impl" == "true" ]]; then
+        if [[ -z "$impl_path" || ! -f "$impl_path" ]]; then
+            include_impl=false
+        fi
+    fi
+
     # Build session info
     local slug="apr-${WORKFLOW}-round-${round_num}"
     local output_file="${output_dir}/round_${round_num}.md"
@@ -1515,7 +2343,7 @@ robot_run() {
 
     # Build prompt using shared function
     local prompt
-    prompt=$(build_revision_prompt "$include_impl")
+    prompt=$(build_revision_prompt "$include_impl" "$config_path")
 
     # Create output directory
     mkdir -p "$(dirname "$output_file")" 2>/dev/null
@@ -1533,6 +2361,9 @@ robot_run() {
         -p "$prompt"
     )
 
+    verbose "robot_run Oracle command: $ORACLE_CMD ${oracle_args[*]}"
+    verbose "robot_run output_file: $output_file"
+
     # Execute in background
     $ORACLE_CMD "${oracle_args[@]}" &
     local oracle_pid=$!
@@ -1544,19 +2375,59 @@ robot_run() {
         --argjson pid "$oracle_pid" \
         --arg output_file "$output_file" \
         --arg workflow "$WORKFLOW" \
-        --argjson round "$round_num" \
+        --arg round "$round_num" \
         --argjson include_impl "$include_impl" \
         '{
             slug: $slug,
             pid: $pid,
             output_file: $output_file,
             workflow: $workflow,
-            round: $round,
+            round: ($round | tonumber),
             include_impl: $include_impl,
             status: "running"
         }')
 
     robot_json true "ok" "$data" "Use 'apr status' or 'apr attach $slug' to monitor"
+}
+
+# Robot: History - List revision rounds
+robot_history() {
+    local rounds_dir="$CONFIG_DIR/rounds/$WORKFLOW"
+
+    if [[ ! -d "$rounds_dir" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg wf "$WORKFLOW" '{resource: "rounds", workflow: $wf}')" "No rounds found for workflow"
+        return 1
+    fi
+
+    local rounds=()
+    for round_file in "$rounds_dir"/round_*.md; do
+        [[ -f "$round_file" ]] || continue
+        local round_num size mod_ts
+        round_num=$(basename "$round_file" .md | sed 's/round_//')
+        size=$(stat -c '%s' "$round_file" 2>/dev/null || stat -f '%z' "$round_file" 2>/dev/null || echo "0")
+        mod_ts=$(stat -c '%Y' "$round_file" 2>/dev/null || stat -f '%m' "$round_file" 2>/dev/null || echo "0")
+
+        rounds+=("$(jq -nc \
+            --arg round "$round_num" \
+            --arg file "$round_file" \
+            --arg size "$size" \
+            --arg mod_ts "$mod_ts" \
+            '{round: ($round | tonumber), file: $file, size: ($size | tonumber), modified: ($mod_ts | tonumber)}')")
+    done
+
+    local rounds_json="[]"
+    if [[ ${#rounds[@]} -gt 0 ]]; then
+        rounds_json=$(printf '%s\n' "${rounds[@]}" | jq -sc .)
+    fi
+
+    local data
+    data=$(jq -nc \
+        --arg workflow "$WORKFLOW" \
+        --argjson count "${#rounds[@]}" \
+        --argjson rounds "$rounds_json" \
+        '{workflow: $workflow, count: $count, rounds: $rounds}')
+
+    robot_json true "ok" "$data"
 }
 
 # Robot: Help - Show robot mode help in JSON
@@ -1571,6 +2442,7 @@ robot_help() {
             init: "Initialize .apr directory",
             validate: "Pre-run validation (apr robot validate <round>)",
             run: "Execute revision round (apr robot run <round>)",
+            history: "List revision rounds for workflow",
             help: "This help"
         },
         options: {
@@ -1583,7 +2455,8 @@ robot_help() {
             "apr robot workflows",
             "apr robot validate 1 -w myspec",
             "apr robot run 1",
-            "apr robot run 2 -w myspec --include-impl"
+            "apr robot run 2 -w myspec --include-impl",
+            "apr robot history -w myspec"
         ]
     }')
 
@@ -1658,6 +2531,9 @@ cmd_robot() {
         run)
             robot_run "${robot_args[0]:-}"
             ;;
+        history)
+            robot_history
+            ;;
         help|--help|-h)
             robot_help
             ;;
@@ -1701,6 +2577,11 @@ show_help() {
         echo "    $(gum style --foreground 82 'update')             Check for and install updates" >&2
         echo "    $(gum style --foreground 82 'help')               Show this help message" >&2
         echo "" >&2
+        gum style --foreground 39 "  Analysis" >&2
+        echo "    $(gum style --foreground 82 'diff <N> [M]')       Compare round outputs (N vs M or N vs N-1)" >&2
+        echo "    $(gum style --foreground 82 'integrate <round>')  Generate Claude Code integration prompt" >&2
+        echo "    $(gum style --foreground 82 'stats')              Show round analytics & convergence signals" >&2
+        echo "" >&2
         gum style --foreground 39 "  Automation" >&2
         echo "    $(gum style --foreground 82 'robot')              Machine-friendly CLI for coding agents" >&2
         echo "" >&2
@@ -1711,10 +2592,14 @@ show_help() {
         gum style --faint "  -d, --dry-run        Preview without sending to GPT Pro" >&2
         gum style --faint "  -r, --render         Render bundle for manual paste" >&2
         gum style --faint "  -c, --copy           Copy rendered bundle to clipboard" >&2
+        gum style --faint "  -o, --output FILE    Output to file (integrate command)" >&2
         gum style --faint "  --wait               Wait for completion (blocking)" >&2
         gum style --faint "  --login              Manual login mode (first-time setup)" >&2
         gum style --faint "  --keep-browser       Keep browser open after completion" >&2
+        gum style --faint "  --no-preflight       Skip pre-flight validation checks" >&2
+        gum style --faint "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         gum style --faint "  --hours NUM          Status window in hours (default: 72)" >&2
+        gum style --faint "  -v, --verbose        Show detailed debug output" >&2
         gum style --faint "  -q, --quiet          Minimal output (errors only)" >&2
         gum style --faint "  --version            Show version" >&2
         echo "" >&2
@@ -1724,6 +2609,9 @@ show_help() {
         gum style --faint "  APR_CACHE            Cache directory (~/.cache/apr)" >&2
         gum style --faint "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
         gum style --faint "  APR_STATUS_HOURS     Default status time window (default: 72)" >&2
+        gum style --faint "  APR_VERBOSE          Enable verbose mode (set to true)" >&2
+        gum style --faint "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
+        gum style --faint "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
         gum style --faint "  APR_NO_GUM           Disable gum even if available" >&2
         gum style --faint "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
@@ -1740,6 +2628,12 @@ show_help() {
         echo "" >&2
         gum style --foreground 39 "  # First run with manual login" >&2
         echo "  apr run 1 --login --wait" >&2
+        echo "" >&2
+        gum style --foreground 39 "  # Compare round outputs" >&2
+        echo "  apr diff 3 5" >&2
+        echo "" >&2
+        gum style --foreground 39 "  # Generate Claude Code integration prompt" >&2
+        echo "  apr integrate 5 --copy" >&2
         echo "" >&2
         gum style --foreground 39 "  # Check session status" >&2
         echo "  apr status" >&2
@@ -1781,6 +2675,11 @@ show_help() {
         echo -e "    ${GREEN}update${NC}             Check for and install updates" >&2
         echo -e "    ${GREEN}help${NC}               Show this help message" >&2
         echo "" >&2
+        echo -e "  ${CYAN}Analysis${NC}" >&2
+        echo -e "    ${GREEN}diff <N> [M]${NC}       Compare round outputs (N vs M or N vs N-1)" >&2
+        echo -e "    ${GREEN}integrate <round>${NC}  Generate Claude Code integration prompt" >&2
+        echo -e "    ${GREEN}stats${NC}              Show round analytics & convergence signals" >&2
+        echo "" >&2
         echo -e "  ${CYAN}Automation${NC}" >&2
         echo -e "    ${GREEN}robot${NC}              Machine-friendly CLI for coding agents" >&2
         echo "" >&2
@@ -1790,10 +2689,14 @@ show_help() {
         echo "  -d, --dry-run        Preview without sending to GPT Pro" >&2
         echo "  -r, --render         Render bundle for manual paste" >&2
         echo "  -c, --copy           Copy rendered bundle to clipboard" >&2
+        echo "  -o, --output FILE    Output to file (integrate command)" >&2
         echo "  --wait               Wait for completion (blocking)" >&2
         echo "  --login              Manual login mode (first-time setup)" >&2
         echo "  --keep-browser       Keep browser open after completion" >&2
+        echo "  --no-preflight       Skip pre-flight validation checks" >&2
+        echo "  --retry/--no-retry   Enable/disable auto-retry (default: enabled)" >&2
         echo "  --hours NUM          Status window in hours (default: 72)" >&2
+        echo "  -v, --verbose        Show detailed debug output" >&2
         echo "  -q, --quiet          Minimal output (errors only)" >&2
         echo "  --version            Show version" >&2
         echo "" >&2
@@ -1802,6 +2705,9 @@ show_help() {
         echo "  APR_CACHE            Cache directory (~/.cache/apr)" >&2
         echo "  APR_CHECK_UPDATES    Enable daily update checking (set to 1)" >&2
         echo "  APR_STATUS_HOURS     Default status time window (default: 72)" >&2
+        echo "  APR_VERBOSE          Enable verbose mode (set to true)" >&2
+        echo "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
+        echo "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
         echo "  APR_NO_GUM           Disable gum even if available" >&2
         echo "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
@@ -1810,6 +2716,8 @@ show_help() {
         echo "  apr run 1                    # Run revision round 1" >&2
         echo "  apr run 2 --include-impl     # Include implementation doc" >&2
         echo "  apr run 1 --login --wait     # First run with manual login" >&2
+        echo "  apr diff 3 5                 # Compare round outputs" >&2
+        echo "  apr integrate 5 --copy       # Generate integration prompt" >&2
         echo "  apr status                   # Check session status" >&2
         echo "  apr robot status             # Robot mode (for agents)" >&2
         echo "" >&2
@@ -1862,20 +2770,7 @@ main() {
 
     # First-run experience: if no args and not configured, show welcome
     if [[ "$command" == "help" && ! -d "$CONFIG_DIR" ]]; then
-        print_banner
-        echo "" >&2
-        print_header "WELCOME TO APR!"
-        echo "" >&2
-        echo "  APR automates iterative specification refinement using" >&2
-        echo "  GPT Pro Extended Reasoning via Oracle." >&2
-        echo "" >&2
-        print_info "To get started, run the setup wizard:"
-        echo "" >&2
-        echo -e "    ${CYAN}apr setup${NC}" >&2
-        echo "" >&2
-        print_dim "This will configure your workflow and document paths."
-        print_dim "For full documentation, run 'apr help'."
-        echo "" >&2
+        show_first_run_welcome
         exit $EXIT_SUCCESS
     fi
 
@@ -1912,6 +2807,9 @@ main() {
     WAIT_MODE=false
     MANUAL_LOGIN=false
     KEEP_BROWSER=false
+    SKIP_PREFLIGHT=false
+    ENABLE_RETRY=true
+    INTEGRATE_OUTPUT=""
     STATUS_HOURS="${APR_STATUS_HOURS:-72}"
 
     local positional_args=()
@@ -1954,6 +2852,26 @@ main() {
                 KEEP_BROWSER=true
                 shift
                 ;;
+            --no-preflight)
+                SKIP_PREFLIGHT=true
+                shift
+                ;;
+            --retry)
+                ENABLE_RETRY=true
+                shift
+                ;;
+            --no-retry)
+                ENABLE_RETRY=false
+                shift
+                ;;
+            -o|--output)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    print_error "Option --output requires a file path"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                INTEGRATE_OUTPUT="$2"
+                shift 2
+                ;;
             --hours)
                 if [[ -z "${2:-}" || "$2" == -* ]]; then
                     print_error "Option --hours requires a number"
@@ -1964,6 +2882,10 @@ main() {
                 ;;
             -q|--quiet)
                 QUIET_MODE=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
                 shift
                 ;;
             --version)
@@ -2000,6 +2922,11 @@ main() {
                 print_info "Usage: apr run <round_number>"
                 exit $EXIT_USAGE_ERROR
             fi
+            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
+                print_error "Round number must be a positive integer"
+                print_info "Usage: apr run <round_number>"
+                exit $EXIT_USAGE_ERROR
+            fi
             run_round "${positional_args[0]}"
             ;;
         setup)
@@ -2028,7 +2955,49 @@ main() {
                 print_info "Usage: apr show <round>"
                 exit $EXIT_USAGE_ERROR
             fi
+            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
+                print_error "Round number must be a positive integer"
+                print_info "Usage: apr show <round>"
+                exit $EXIT_USAGE_ERROR
+            fi
             show_round "${positional_args[0]}"
+            ;;
+        diff)
+            if [[ ${#positional_args[@]} -lt 1 ]]; then
+                print_error "At least one round number required"
+                print_info "Usage: apr diff <round> [round2]"
+                print_info "  apr diff 5      # Compare round 5 with round 4"
+                print_info "  apr diff 3 7    # Compare round 3 with round 7"
+                exit $EXIT_USAGE_ERROR
+            fi
+            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
+                print_error "Round number must be a positive integer"
+                exit $EXIT_USAGE_ERROR
+            fi
+            local round_b=""
+            if [[ ${#positional_args[@]} -ge 2 ]]; then
+                if [[ ! "${positional_args[1]}" =~ ^[0-9]+$ ]]; then
+                    print_error "Second round number must be a positive integer"
+                    exit $EXIT_USAGE_ERROR
+                fi
+                round_b="${positional_args[1]}"
+            fi
+            diff_rounds "${positional_args[0]}" "$round_b"
+            ;;
+        integrate)
+            if [[ ${#positional_args[@]} -lt 1 ]]; then
+                print_error "Round number required"
+                print_info "Usage: apr integrate <round> [--copy] [--output FILE]"
+                exit $EXIT_USAGE_ERROR
+            fi
+            if [[ ! "${positional_args[0]}" =~ ^[0-9]+$ ]]; then
+                print_error "Round number must be a positive integer"
+                exit $EXIT_USAGE_ERROR
+            fi
+            generate_integration "${positional_args[0]}"
+            ;;
+        stats)
+            show_stats
             ;;
         update)
             cmd_update
