@@ -301,13 +301,19 @@ teardown() {
     create_mock_round 1
     create_mock_round 2
 
+    # Generate metrics first
+    run "$APR_SCRIPT" backfill
+    assert_success
+
     run "$APR_SCRIPT" stats --json
 
     log_test_output "$output"
 
     assert_success
-    # Should be valid JSON
-    echo "$output" | jq . >/dev/null 2>&1
+    # Should be valid JSON - extract JSON from output (skip any non-JSON lines)
+    local json_output
+    json_output=$(echo "$output" | grep '^{' | head -1)
+    echo "$json_output" | jq . >/dev/null 2>&1
 }
 
 @test "apr stats: --detailed shows more information" {
@@ -373,29 +379,30 @@ teardown() {
 @test "apr backfill: skips existing metrics without --force" {
     create_mock_round 1
 
-    # First backfill
-    "$APR_SCRIPT" backfill
+    # First backfill (use run to capture result)
+    run "$APR_SCRIPT" backfill
+    log_test_output "$output"
+    assert_success
 
-    # Record original mtime
-    local orig_mtime
-    orig_mtime=$(stat -c %Y ".apr/analytics/default/metrics.json" 2>/dev/null || stat -f %m ".apr/analytics/default/metrics.json" 2>/dev/null)
-
-    sleep 1
+    # Verify metrics file was created
+    [[ -f ".apr/analytics/default/metrics.json" ]]
 
     # Second backfill without --force
     run "$APR_SCRIPT" backfill
 
     log_test_output "$output"
 
-    # Should skip or warn
-    [[ "$output" == *"skip"* ]] || [[ "$output" == *"exist"* ]] || [[ "$output" == *"force"* ]] || [[ $status -eq 0 ]]
+    # Should skip or warn (or succeed idempotently)
+    [[ "$output" == *"skip"* ]] || [[ "$output" == *"exist"* ]] || [[ "$output" == *"force"* ]] || [[ "$output" == *"already"* ]] || [[ $status -eq 0 ]]
 }
 
 @test "apr backfill: --force overwrites existing" {
     create_mock_round 1
 
-    # First backfill
-    "$APR_SCRIPT" backfill
+    # First backfill (use run to capture result)
+    run "$APR_SCRIPT" backfill
+    log_test_output "$output"
+    assert_success
 
     # Add another round
     create_mock_round 2

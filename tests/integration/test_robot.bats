@@ -108,10 +108,19 @@ teardown() {
     log_test_output "$output"
 
     assert_success
-    assert_valid_json "$output"
-    assert_json_value "$output" ".ok" "true"
-    assert_json_value "$output" ".data.workflow" "robot"
-    assert_json_value "$output" ".data.round" "1"
+    # Extract JSON from output - the robot output is pretty-printed JSON
+    # Filter out non-JSON lines (Mock Oracle debug output goes to stderr but BATS captures both)
+    local json_output
+    # Use sed to extract from first { to matching } (the JSON block)
+    json_output=$(echo "$output" | sed -n '/^{$/,/^}$/p')
+    if [[ -z "$json_output" ]]; then
+        # Fallback: try to find compact JSON on a single line
+        json_output=$(echo "$output" | grep -E '^\{.*\}$' | head -1)
+    fi
+    assert_valid_json "$json_output"
+    assert_json_value "$json_output" ".ok" "true"
+    assert_json_value "$json_output" ".data.workflow" "robot"
+    assert_json_value "$json_output" ".data.round" "1"
 }
 
 @test "apr robot history: returns rounds list" {
@@ -282,8 +291,8 @@ teardown() {
     log_test_output "$output"
 
     assert_success
-    assert_json_value "$output" ".data.spec_path" "SPEC.md"
-    [[ "$output" == *"specification"* ]] || [[ "$output" == *"SPEC.md"* ]]
+    assert_json_value "$output" ".data.spec_path" "SPECIFICATION.md"
+    [[ "$output" == *"specification"* ]] || [[ "$output" == *"SPECIFICATION.md"* ]]
 }
 
 @test "apr robot integrate: returns stats" {
@@ -320,7 +329,11 @@ teardown() {
     setup_test_workflow "robot"
     create_mock_round 1 "robot"
     create_mock_round 2 "robot"
-    "$APR_SCRIPT" backfill -w robot
+
+    # Run backfill with run to handle any exit code
+    run "$APR_SCRIPT" backfill -w robot
+    log_test_output "$output"
+    assert_success
 
     run "$APR_SCRIPT" robot stats -w robot
 

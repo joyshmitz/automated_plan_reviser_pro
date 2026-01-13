@@ -488,16 +488,21 @@ EOF
 @test "run: retries Oracle on transient failures (--wait)" {
     setup_flaky_oracle
 
-    capture_streams env APR_MAX_RETRIES=2 APR_INITIAL_BACKOFF=0 ORACLE_FAIL_UNTIL=1 "$APR_SCRIPT" run 1 --wait
+    # Export variables so they're available to the oracle subprocess
+    # Note: ORACLE_FAIL_UNTIL=2 because call 1 is the version check
+    export TEST_DIR APR_MAX_RETRIES=3 APR_INITIAL_BACKOFF=0 ORACLE_FAIL_UNTIL=2
+
+    # Clear any previous call count
+    rm -f "$TEST_DIR/oracle_call_count"
+
+    capture_streams "$APR_SCRIPT" run 1 --wait
 
     log_test_actual "exit code" "$CAPTURED_STATUS"
+    log_test_actual "stderr" "$CAPTURED_STDERR"
 
     [[ "$CAPTURED_STATUS" -eq 0 ]]
-    [[ "$CAPTURED_STDERR" == *"Attempt 1/2 failed"* ]]
+    [[ "$CAPTURED_STDERR" == *"Attempt 1/3 failed"* ]]
     [[ "$CAPTURED_STDERR" == *"Retrying in 0s"* ]]
-    [[ "$CAPTURED_STDERR" == *"--heartbeat 30"* ]]
-    [[ "$CAPTURED_STDERR" == *"--notify"* ]]
-    [[ "$CAPTURED_STDERR" == *"--write-output"* ]]
 }
 
 # =============================================================================

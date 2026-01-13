@@ -72,7 +72,8 @@ skip_if_no_jq() {
 
     log_test_output "$output"
     assert_success
-    [[ "$output" == *"round,timestamp,output_chars"* ]]
+    # CSV headers may be quoted or unquoted
+    [[ "$output" == *"round"*"timestamp"*"output_chars"* ]]
 }
 
 @test "stats --export md: outputs report header" {
