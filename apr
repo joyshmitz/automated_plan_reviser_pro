@@ -155,17 +155,25 @@ acquire_lock() {
         echo "$$" >&"$APR_LOCK_FD"
     else
         # Fallback: simple file-based locking
-        if [[ -f "$APR_LOCK_FILE" ]]; then
-            local pid
-            pid=$(cat "$APR_LOCK_FILE" 2>/dev/null || echo "")
-            # Check if the process is still running
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                return 1
-            fi
-            # Stale lock file - remove it
-            rm -f "$APR_LOCK_FILE"
+        # Try atomic creation first (noclobber)
+        if (set -C; echo "$$" > "$APR_LOCK_FILE") 2>/dev/null; then
+            return 0
         fi
-        echo "$$" > "$APR_LOCK_FILE"
+
+        # File exists - check if stale
+        local pid
+        pid=$(cat "$APR_LOCK_FILE" 2>/dev/null || echo "")
+        # Check if the process is still running
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+        
+        # Stale lock file - remove and retry once
+        rm -f "$APR_LOCK_FILE"
+        if (set -C; echo "$$" > "$APR_LOCK_FILE") 2>/dev/null; then
+            return 0
+        fi
+        return 1
     fi
     return 0
 }
@@ -4321,6 +4329,224 @@ robot_stats() {
     robot_json true "ok" "$data"
 }
 
+# Robot: Show - View round content with metadata
+robot_show() {
+    local round_num="${1:-}"
+    local workflow="${WORKFLOW:-default}"
+
+    if [[ -z "$round_num" ]]; then
+        robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
+        return 1
+    fi
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
+        return 1
+    fi
+
+    local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
+    if [[ ! -f "$round_file" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg r "$round_num" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round not found"
+        return 1
+    fi
+
+    local content char_count line_count word_count mtime
+    content=$(cat "$round_file")
+    char_count=${#content}
+    line_count=$(wc -l < "$round_file" | tr -d ' ')
+    word_count=$(wc -w < "$round_file" | tr -d ' ')
+    mtime=$(stat -c %Y "$round_file" 2>/dev/null || stat -f %m "$round_file" 2>/dev/null || echo "0")
+
+    local data
+    data=$(jq -nc \
+        --arg workflow "$workflow" \
+        --argjson round "$round_num" \
+        --arg content "$content" \
+        --argjson char_count "$char_count" \
+        --argjson line_count "$line_count" \
+        --argjson word_count "$word_count" \
+        --argjson mtime "$mtime" \
+        --arg path "$round_file" \
+        '{
+            workflow: $workflow,
+            round: $round,
+            content: $content,
+            stats: {
+                chars: $char_count,
+                lines: $line_count,
+                words: $word_count
+            },
+            mtime: $mtime,
+            path: $path
+        }')
+
+    robot_json true "ok" "$data"
+}
+
+# Robot: Diff - Compare two rounds
+robot_diff() {
+    local round_a="${1:-}"
+    local round_b="${2:-}"
+    local workflow="${WORKFLOW:-default}"
+
+    if [[ -z "$round_a" ]]; then
+        robot_json false "missing_argument" '{"argument":"round_a"}' "At least one round number required"
+        return 1
+    fi
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
+        return 1
+    fi
+
+    local rounds_dir="$CONFIG_DIR/rounds/$workflow"
+
+    # If only one round given, compare with previous
+    if [[ -z "$round_b" ]]; then
+        if [[ "$round_a" -le 1 ]]; then
+            robot_json false "invalid_argument" '{"argument":"round_a","reason":"no_previous"}' "Round 1 has no previous round to compare with"
+            return 1
+        fi
+        round_b=$((round_a - 1))
+    fi
+
+    local file_a="$rounds_dir/round_${round_a}.md"
+    local file_b="$rounds_dir/round_${round_b}.md"
+
+    if [[ ! -f "$file_a" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg r "$round_a" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_a not found"
+        return 1
+    fi
+    if [[ ! -f "$file_b" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg r "$round_b" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round $round_b not found"
+        return 1
+    fi
+
+    # Get file stats
+    local size_a size_b lines_a lines_b
+    size_a=$(stat -c %s "$file_a" 2>/dev/null || stat -f %z "$file_a" 2>/dev/null || echo "0")
+    size_b=$(stat -c %s "$file_b" 2>/dev/null || stat -f %z "$file_b" 2>/dev/null || echo "0")
+    lines_a=$(wc -l < "$file_a" | tr -d ' ')
+    lines_b=$(wc -l < "$file_b" | tr -d ' ')
+
+    # Generate unified diff
+    local diff_output diff_stats
+    diff_output=$(diff -u "$file_b" "$file_a" 2>/dev/null || true)
+
+    # Calculate diff stats
+    local additions deletions
+    additions=$(echo "$diff_output" | grep -c '^+[^+]' || echo "0")
+    deletions=$(echo "$diff_output" | grep -c '^-[^-]' || echo "0")
+
+    local data
+    data=$(jq -nc \
+        --arg workflow "$workflow" \
+        --argjson round_a "$round_a" \
+        --argjson round_b "$round_b" \
+        --argjson size_a "$size_a" \
+        --argjson size_b "$size_b" \
+        --argjson lines_a "$lines_a" \
+        --argjson lines_b "$lines_b" \
+        --argjson additions "$additions" \
+        --argjson deletions "$deletions" \
+        --arg diff "$diff_output" \
+        '{
+            workflow: $workflow,
+            comparing: {from: $round_b, to: $round_a},
+            stats: {
+                before: {bytes: $size_b, lines: $lines_b},
+                after: {bytes: $size_a, lines: $lines_a},
+                changes: {additions: $additions, deletions: $deletions}
+            },
+            diff: $diff
+        }')
+
+    robot_json true "ok" "$data"
+}
+
+# Robot: Integrate - Generate Claude Code integration prompt
+robot_integrate() {
+    local round_num="${1:-}"
+    local workflow="${WORKFLOW:-default}"
+
+    if [[ -z "$round_num" ]]; then
+        robot_json false "missing_argument" '{"argument":"round"}' "Round number required"
+        return 1
+    fi
+
+    # Verify workflow exists
+    local workflow_file="$CONFIG_DIR/workflows/${workflow}.yaml"
+    if [[ ! -f "$workflow_file" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg wf "$workflow" '{resource: "workflow", name: $wf}')" "Workflow not found"
+        return 1
+    fi
+
+    # Get spec path
+    local spec_path
+    spec_path=$(yaml_unquote "$(get_config_value "spec" "$workflow_file")")
+    if [[ -z "$spec_path" ]]; then
+        robot_json false "config_error" '{"field":"spec"}' "Spec path not configured in workflow"
+        return 1
+    fi
+
+    local round_file="$CONFIG_DIR/rounds/$workflow/round_${round_num}.md"
+    if [[ ! -f "$round_file" ]]; then
+        robot_json false "not_found" "$(jq -nc --arg r "$round_num" --arg wf "$workflow" '{resource: "round", round: $r, workflow: $wf}')" "Round not found"
+        return 1
+    fi
+
+    local round_content round_size
+    round_content=$(cat "$round_file")
+    round_size=${#round_content}
+
+    # Build the integration prompt
+    local prompt
+    prompt=$(cat <<'PROMPT_HEADER'
+First read ALL of the AGENTS.md file and README.md file super carefully
+and understand ALL of both! Then use your code investigation agent mode
+to fully understand the code and technical architecture of the project.
+PROMPT_HEADER
+)
+    prompt+="
+Read ALL of the specification document at: $spec_path
+
+Now integrate the following feedback from GPT Pro 5.2 Extended Reasoning
+(Round $round_num of the APR iterative refinement process). For each
+suggestion, carefully evaluate whether you agree with the proposed change.
+Then apply the changes you endorse to the specification document.
+
+Be meticulous and use ultrathink.
+
+---
+
+$round_content"
+
+    local data
+    data=$(jq -nc \
+        --arg workflow "$workflow" \
+        --argjson round "$round_num" \
+        --arg spec_path "$spec_path" \
+        --arg prompt "$prompt" \
+        --argjson round_size "$round_size" \
+        --argjson prompt_size "${#prompt}" \
+        '{
+            workflow: $workflow,
+            round: $round,
+            spec_path: $spec_path,
+            prompt: $prompt,
+            stats: {
+                round_chars: $round_size,
+                prompt_chars: $prompt_size
+            }
+        }')
+
+    robot_json true "ok" "$data" "Copy .data.prompt to Claude Code"
+}
+
 # Robot: Help - Show robot mode help in JSON
 robot_help() {
     local data
@@ -4333,6 +4559,9 @@ robot_help() {
             init: "Initialize .apr directory",
             validate: "Pre-run validation (apr robot validate <round>)",
             run: "Execute revision round (apr robot run <round>)",
+            show: "View round content (apr robot show <round>)",
+            diff: "Compare rounds (apr robot diff <N> [M])",
+            integrate: "Get Claude integration prompt (apr robot integrate <round>)",
             history: "List revision rounds for workflow",
             stats: "Show analytics metrics summary",
             help: "This help"
