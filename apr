@@ -136,6 +136,21 @@ APR_ORACLE_SETTLE_WINDOW_MS="${APR_ORACLE_SETTLE_WINDOW_MS:-30000}" # Settle win
 APR_ORACLE_STABLE_CYCLES="${APR_ORACLE_STABLE_CYCLES:-12}"         # Required stable cycles for normal (default: 12)
 APR_ORACLE_PATCHED=false                                           # Track if we've patched Oracle this session
 
+# Validate Oracle threshold env vars are positive integers
+for _apr_var in APR_ORACLE_MIN_STABLE_MS APR_ORACLE_SHORT_STABLE_MS APR_ORACLE_SETTLE_WINDOW_MS APR_ORACLE_STABLE_CYCLES; do
+    _apr_val="${!_apr_var}"
+    if ! [[ "$_apr_val" =~ ^[0-9]+$ ]] || [[ "$_apr_val" -eq 0 ]]; then
+        echo "Warning: $_apr_var must be a positive integer, got '$_apr_val'. Using default." >&2
+        case "$_apr_var" in
+            APR_ORACLE_MIN_STABLE_MS) APR_ORACLE_MIN_STABLE_MS=30000 ;;
+            APR_ORACLE_SHORT_STABLE_MS) APR_ORACLE_SHORT_STABLE_MS=15000 ;;
+            APR_ORACLE_SETTLE_WINDOW_MS) APR_ORACLE_SETTLE_WINDOW_MS=30000 ;;
+            APR_ORACLE_STABLE_CYCLES) APR_ORACLE_STABLE_CYCLES=12 ;;
+        esac
+    fi
+done
+unset _apr_var _apr_val
+
 # Temp directory for cleanup on exit
 APR_TEMP_DIR=""
 
@@ -639,9 +654,12 @@ oracle_detect_features() {
 #   stableCycles: 6 (normal), 12 (short)
 #
 # Patched values (configured via APR_ORACLE_* env vars):
-#   minStableMs: 30000ms (normal), 15000ms (short)
-#   settleWindowMs: 30000ms (normal), 15000ms (short)
-#   stableCycles: 12 (normal), 18 (short)
+#   minStableMs: APR_ORACLE_MIN_STABLE_MS (normal), APR_ORACLE_SHORT_STABLE_MS (short)
+#   settleWindowMs: APR_ORACLE_SETTLE_WINDOW_MS (normal), 15000ms (short)
+#   stableCycles: APR_ORACLE_STABLE_CYCLES (normal), 18 (short)
+#
+# NOTE: If Oracle is updated via npm, the backup may become stale.
+# Run `apr --restore-oracle` or delete the .apr-backup file to re-patch.
 
 ORACLE_ASSISTANT_RESPONSE_PATH=""
 ORACLE_BACKUP_PATH=""
@@ -774,12 +792,21 @@ patch_oracle_stability_thresholds() {
 
 restore_oracle_from_backup() {
     # Restore Oracle's original assistantResponse.js from backup
-    if [[ -z "$ORACLE_BACKUP_PATH" ]]; then
+    if [[ -z "$ORACLE_BACKUP_PATH" ]] || [[ -z "$ORACLE_ASSISTANT_RESPONSE_PATH" ]]; then
         find_oracle_assistant_response || return 1
     fi
 
     if [[ ! -f "$ORACLE_BACKUP_PATH" ]]; then
         print_error "No Oracle backup found at $ORACLE_BACKUP_PATH"
+        return 1
+    fi
+
+    # Verify destination directory exists (Oracle might have been uninstalled)
+    local dest_dir
+    dest_dir=$(dirname "$ORACLE_ASSISTANT_RESPONSE_PATH")
+    if [[ ! -d "$dest_dir" ]]; then
+        print_error "Oracle installation directory not found: $dest_dir"
+        print_error "Oracle may have been uninstalled. Backup preserved at: $ORACLE_BACKUP_PATH"
         return 1
     fi
 
@@ -3141,6 +3168,8 @@ run_round() {
                         verbose "Recovery output also invalid: $OUTPUT_VALIDATION_REASON"
                     fi
                 else
+                    # Clean up any partial recovery file that might have been created
+                    rm -f "$recovery_output_file" 2>/dev/null
                     verbose "Oracle session reattach failed for slug: $slug"
                 fi
 
