@@ -1615,84 +1615,6 @@ metrics_write_convergence() {
     verbose "metrics_write_convergence: updated convergence for workflow '$workflow'"
 }
 
-
-
-    
-
-
-
-        merged=$(echo "$current_json" | jq -c \
-
-
-
-            --argjson convergence "$convergence_json" \
-
-
-
-            --arg ts "$ts" \
-
-
-
-            '
-
-
-
-            .convergence = $convergence
-
-
-
-            | .updated_at = $ts
-
-
-
-            ')
-
-
-
-    
-
-
-
-        if [[ $? -ne 0 ]]; then
-
-
-
-            print_error "Failed to merge convergence metrics"
-
-
-
-            metrics_unlock "$workflow"
-
-
-
-            return 1
-
-
-
-        fi
-
-
-
-    
-
-
-
-        metrics_write_file "$workflow" "$merged"
-
-
-
-        metrics_unlock "$workflow"
-
-
-
-        verbose "metrics_write_convergence: updated convergence for workflow '$workflow'"
-
-
-
-    }
-
-
-
 # Internal: Write JSON to metrics file (atomic via rename)
 
 # Assumes lock is held by caller if used in RMW cycle.
@@ -2838,6 +2760,7 @@ run_round() {
         for f in "${file_args[@]}"; do
             echo "    $f \\" >&2
         done
+        echo "    --browser-attachments never \\" >&2
         echo "    --slug \"$slug\" \\" >&2
         echo "    --write-output \"$output_file\" \\" >&2
         [[ "$manual_login" == "true" ]] && echo "    --browser-manual-login \\" >&2
@@ -2870,6 +2793,7 @@ run_round() {
         --engine browser
         -m "$model"
         "${file_args[@]}"
+        --browser-attachments never  # Paste inline, never upload as files
         --slug "$slug"
         --write-output "$output_file"
         --files-report
@@ -5168,6 +5092,7 @@ robot_run() {
         --engine browser
         -m "$model"
         "${file_args[@]}"
+        --browser-attachments never  # Paste inline, never upload as files
         --slug "$slug"
         --write-output "$output_file"
         --files-report
