@@ -1261,7 +1261,9 @@ file_picker() {
     local path=""
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         # Don't use --all to hide hidden files (.git, .apr, etc.)
-        gum file --file --header "$prompt"
+        # Use --height for better folder visibility and --show-help for navigation hints
+        # Users can navigate into directories by pressing Enter on them
+        gum file --file --header "$prompt" --height 20 --show-help
     else
         read -rp "$prompt (enter path): " path
         echo "$path"
