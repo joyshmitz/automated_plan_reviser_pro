@@ -225,22 +225,24 @@ For headless/SSH environments, see README.md section on Oracle Remote Setup.
 
 ---
 
-## Issue Tracking with bd (beads)
+## Issue Tracking with br (beads_rust)
 
-All issue tracking goes through **bd**. No other TODO systems.
+All issue tracking goes through **br**. No other TODO systems.
+
+**Note:** `br` is non-invasive—it never executes git commands directly. You must run git commands manually after `br sync --flush-only`.
 
 Key invariants:
 
 - `.beads/` is authoritative state and **must always be committed** with code changes.
-- Do not edit `.beads/*.jsonl` directly; only via `bd`.
+- Do not edit `.beads/*.jsonl` directly; only via `br`.
 
 ### Basics
 
 ```bash
-bd ready --json                    # Check ready work
-bd create "Issue title" -t task    # Create issue
-bd update bd-42 --status in_progress  # Update status
-bd close bd-42 --reason "Done"     # Complete issue
+br ready --json                    # Check ready work
+br create "Issue title" -t task    # Create issue
+br update br-42 --status in_progress  # Update status
+br close br-42 --reason "Done"     # Complete issue
 ```
 
 ---
@@ -257,7 +259,9 @@ bd close bd-42 --reason "Done"     # Complete issue
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd sync
+   br sync --flush-only
+   git add .beads/
+   git commit -m "Update beads"
    git push
    git status  # MUST show "up to date with origin"
    ```
@@ -583,31 +587,33 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
+**Note:** `br` is non-invasive—it never executes git commands directly. You must run git commands manually after `br sync --flush-only`.
+
 ### Essential Commands
 
 ```bash
 # CLI commands for agents
-bd ready              # Show issues ready to work (no blockers)
-bd list --status=open # All open issues
-bd show <id>          # Full issue details with dependencies
-bd create --title="..." --type=task --priority=2
-bd update <id> --status=in_progress
-bd close <id> --reason="Completed"
-bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
+br ready              # Show issues ready to work (no blockers)
+br list --status=open # All open issues
+br show <id>          # Full issue details with dependencies
+br create --title="..." --type=task --priority=2
+br update <id> --status=in_progress
+br close <id> --reason="Completed"
+br close <id1> <id2>  # Close multiple issues at once
+br sync --flush-only  # Export to JSONL (then manually: git add .beads/ && git commit)
 ```
 
 ### Workflow Pattern
 
-1. **Start**: Run `bd ready` to find actionable work
-2. **Claim**: Use `bd update <id> --status=in_progress`
+1. **Start**: Run `br ready` to find actionable work
+2. **Claim**: Use `br update <id> --status=in_progress`
 3. **Work**: Implement the task
-4. **Complete**: Use `bd close <id>`
-5. **Sync**: Always run `bd sync` at session end
+4. **Complete**: Use `br close <id>`
+5. **Sync**: Run `br sync --flush-only`, then `git add .beads/ && git commit -m "Update beads"`
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. `bd ready` shows only unblocked work.
+- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
 - **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
 - **Types**: task, bug, feature, epic, question, docs
 
