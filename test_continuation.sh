@@ -4,9 +4,7 @@ jq_cmd() {
 }
 
 out=$(echo "in" | jq_cmd \
-
     --arg1 "val1" \
-
     --arg2 "val2"
 )
 echo "Output: $out"
