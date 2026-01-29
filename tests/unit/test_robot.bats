@@ -96,10 +96,13 @@ teardown() {
     ROBOT_FORMAT="json"
     ROBOT_STATS=true
 
-    # Need toon.sh or tru available for stats comparison
+    # Need tru available for stats comparison
     if ! command -v tru >/dev/null 2>&1; then
         skip "tru not available"
     fi
+
+    # Point to real toon.sh location (test env has isolated HOME)
+    export TOON_SH_PATH="${REAL_HOME:-/home/ubuntu}/.local/lib/toon.sh"
 
     capture_streams robot_json true "ok" '{"items":[1,2,3,4,5]}'
 
@@ -119,6 +122,9 @@ teardown() {
     if ! command -v tru >/dev/null 2>&1; then
         skip "tru not available"
     fi
+
+    # Point to real toon.sh location (test env has isolated HOME)
+    export TOON_SH_PATH="${REAL_HOME:-/home/ubuntu}/.local/lib/toon.sh"
 
     capture_streams robot_json true "ok" '{"items":[1,2,3,4,5]}'
 

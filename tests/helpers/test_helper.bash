@@ -51,6 +51,9 @@ setup_test_environment() {
     TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/apr_test.XXXXXX")"
     export TEST_DIR
 
+    # Save real home for tests that need access to installed tools
+    export REAL_HOME="${HOME}"
+
     # Create isolated home directory
     TEST_HOME="$TEST_DIR/home"
     mkdir -p "$TEST_HOME"
