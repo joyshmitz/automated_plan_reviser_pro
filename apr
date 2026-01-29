@@ -5246,6 +5246,7 @@ backfill_all_workflows() {
 # shellcheck disable=SC2034  # State flag for helper functions
 ROBOT_MODE=false
 ROBOT_COMPACT=false
+ROBOT_STATS=false
 # Robot output format (resolved in cmd_robot): json|toon
 ROBOT_FORMAT="json"
 ROBOT_FORMAT_OVERRIDE=""
@@ -5335,6 +5336,19 @@ robot_json() {
     if [[ "${ROBOT_FORMAT:-json}" == "toon" ]]; then
         local toon_out
         if toon_out="$(robot_json_to_toon "$result" 2>/dev/null)"; then
+            # Show stats if requested
+            if [[ "${ROBOT_STATS:-false}" == "true" ]]; then
+                local json_bytes toon_bytes savings
+                json_bytes=$(printf '%s' "$result" | wc -c)
+                toon_bytes=$(printf '%s' "$toon_out" | wc -c)
+                if [[ $json_bytes -gt 0 ]]; then
+                    savings=$((100 - (toon_bytes * 100 / json_bytes)))
+                else
+                    savings=0
+                fi
+                printf '[apr-toon] JSON: %d bytes, TOON: %d bytes (%d%% savings)\n' \
+                    "$json_bytes" "$toon_bytes" "$savings" >&2
+            fi
             printf '%s' "$toon_out"
         else
             echo "[toon] warn: tru/toon.sh not available; outputting JSON" >&2
@@ -5345,6 +5359,24 @@ robot_json() {
             fi
         fi
         return 0
+    fi
+
+    # Show stats for JSON mode if requested (compares against potential TOON savings)
+    if [[ "${ROBOT_STATS:-false}" == "true" ]]; then
+        local json_bytes toon_out toon_bytes savings
+        json_bytes=$(printf '%s' "$result" | wc -c)
+        if toon_out="$(robot_json_to_toon "$result" 2>/dev/null)"; then
+            toon_bytes=$(printf '%s' "$toon_out" | wc -c)
+            if [[ $json_bytes -gt 0 ]]; then
+                savings=$((100 - (toon_bytes * 100 / json_bytes)))
+            else
+                savings=0
+            fi
+            printf '[apr-toon] JSON: %d bytes, TOON would be: %d bytes (%d%% potential savings)\n' \
+                "$json_bytes" "$toon_bytes" "$savings" >&2
+        else
+            printf '[apr-toon] JSON: %d bytes (TOON unavailable for comparison)\n' "$json_bytes" >&2
+        fi
     fi
 
     if [[ "$ROBOT_COMPACT" == "true" ]]; then
@@ -6170,6 +6202,7 @@ robot_help() {
             "-w, --workflow NAME": "Workflow name (default: from config)",
             "-i, --include-impl": "Include implementation document",
             "-f, --format FORMAT": "Robot output format: json or toon (env: APR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)",
+            "--stats": "Show token savings statistics (JSON vs TOON byte comparison)",
             "--compact": "Minified JSON output"
         },
         examples: [
@@ -6214,6 +6247,10 @@ cmd_robot() {
         case $1 in
             --compact)
                 ROBOT_COMPACT=true
+                shift
+                ;;
+            --stats)
+                ROBOT_STATS=true
                 shift
                 ;;
             --format|-f)

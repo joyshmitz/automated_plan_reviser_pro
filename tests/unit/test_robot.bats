@@ -91,6 +91,45 @@ teardown() {
     [[ "$CAPTURED_STDERR" == *"[toon] warn:"* ]]
 }
 
+@test "robot_json: --stats emits token savings to stderr for JSON mode" {
+    ROBOT_COMPACT=true
+    ROBOT_FORMAT="json"
+    ROBOT_STATS=true
+
+    # Need toon.sh or tru available for stats comparison
+    if ! command -v tru >/dev/null 2>&1; then
+        skip "tru not available"
+    fi
+
+    capture_streams robot_json true "ok" '{"items":[1,2,3,4,5]}'
+
+    assert_valid_json "$CAPTURED_STDOUT"
+    # Stats should be printed to stderr
+    [[ "$CAPTURED_STDERR" == *"[apr-toon]"* ]]
+    [[ "$CAPTURED_STDERR" == *"bytes"* ]]
+    [[ "$CAPTURED_STDERR" == *"potential savings"* ]]
+}
+
+@test "robot_json: --stats emits token savings to stderr for TOON mode" {
+    ROBOT_COMPACT=true
+    ROBOT_FORMAT="toon"
+    ROBOT_STATS=true
+
+    # Need tru available for TOON mode
+    if ! command -v tru >/dev/null 2>&1; then
+        skip "tru not available"
+    fi
+
+    capture_streams robot_json true "ok" '{"items":[1,2,3,4,5]}'
+
+    # Stats should be printed to stderr
+    [[ "$CAPTURED_STDERR" == *"[apr-toon]"* ]]
+    [[ "$CAPTURED_STDERR" == *"bytes"* ]]
+    [[ "$CAPTURED_STDERR" == *"savings"* ]]
+    # Output should NOT be JSON (should be TOON)
+    [[ "${CAPTURED_STDOUT:0:1}" != "{" ]]
+}
+
 # =============================================================================
 # robot_status() Tests
 # =============================================================================
@@ -173,6 +212,7 @@ teardown() {
     assert_json_value "$output" ".data.commands.status" "System overview (config, workflows, oracle)"
     assert_json_value "$output" ".data.options[\"-w, --workflow NAME\"]" "Workflow name (default: from config)"
     assert_json_value "$output" ".data.options[\"-f, --format FORMAT\"]" "Robot output format: json or toon (env: APR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)"
+    assert_json_value "$output" ".data.options[\"--stats\"]" "Show token savings statistics (JSON vs TOON byte comparison)"
 }
 
 # =============================================================================
