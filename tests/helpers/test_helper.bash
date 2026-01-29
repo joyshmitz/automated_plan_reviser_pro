@@ -51,6 +51,9 @@ setup_test_environment() {
     TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/apr_test.XXXXXX")"
     export TEST_DIR
 
+    # Save real home for tests that need access to installed tools
+    export REAL_HOME="${HOME}"
+
     # Create isolated home directory
     TEST_HOME="$TEST_DIR/home"
     mkdir -p "$TEST_HOME"
@@ -199,38 +202,18 @@ rounds:
   output_dir: .apr/rounds/$workflow
 
 template: |
-  First, read this README:
+  First, read the attached README.md.
 
-  <readme>
-  {{README}}
-  </readme>
-
-  Now read the specification:
-
-  <spec>
-  {{SPEC}}
-  </spec>
+  Now read the attached SPECIFICATION.md.
 
   Please analyze and provide feedback.
 
 template_with_impl: |
-  First, read this README:
+  First, read the attached README.md.
 
-  <readme>
-  {{README}}
-  </readme>
+  Now read the attached SPECIFICATION.md.
 
-  Now read the specification:
-
-  <spec>
-  {{SPEC}}
-  </spec>
-
-  And the implementation:
-
-  <implementation>
-  {{IMPL}}
-  </implementation>
+  And the attached IMPLEMENTATION.md.
 
   Please analyze and provide feedback.
 EOF
